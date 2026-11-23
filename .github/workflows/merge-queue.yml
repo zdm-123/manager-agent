@@ -1,0 +1,62 @@
+name: "Merge Queue Gate"
+
+on:
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: merge-queue-gate-${{ github.event.merge_group.head_sha || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    name: Merged-tree consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout merged tree
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.merge_group.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Validate merged-tree consistency
+        run: uv run --no-project --with pyyaml python ci/run-merge-queue-tests.py
+
+      - name: Publish consistency report
+        if: always()
+        run: |
+          if [ -f ci/harness/coverage-map-report.md ]; then
+            cat ci/harness/coverage-map-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload merge queue artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merge-queue-results
+          path: |
+            ci/merge-queue-results.json
+            ci/harness/coverage-map-report.json
+            ci/harness/coverage-map-report.md
+
+  merge-queue-gate:
+    name: Merge Queue Gate
+    needs: deterministic
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require consistency checks to succeed
+        env:
+          DETERMINISTIC_RESULT: ${{ needs.deterministic.result }}
+        run: test "$DETERMINISTIC_RESULT" = success

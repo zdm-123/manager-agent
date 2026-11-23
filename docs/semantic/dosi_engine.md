@@ -1,0 +1,40 @@
+# Dosi Semantic Engine
+
+Manager Agent includes the `dosi-engine` Python binding as a locked dependency. Agent's semantic tools call the native engine through a small runtime in `manager/tools/semantic_tools/dosi/`.
+
+## Install
+
+From a Manager-agent checkout:
+
+```bash
+uv sync --locked
+```
+
+The lockfile pins the engine version used by Agent and CI. Use the locked environment for development and deployment.
+
+## Configure
+
+```yaml
+agent:
+  services:
+    datasources:
+      warehouse:
+        type: duckdb
+        uri: /absolute/path/to/warehouse.db
+```
+
+Dosi is built in and needs no engine selection. Agent discovers OSI YAML or JSON files recursively under `subject/semantic_models/<datasource>/`, excluding per-metric fragments. Use `semantic_model_path` to select a specific file for a request. Old `agent.services.semantic_layer` and project `semantic` settings are ignored with a warning.
+
+Apache Ossie ontologies live in the flat, project-wide `subject/ontology/` directory, with the mapping documents that bind each one to semantic model files. A mapping names its model by a relative `semantic_model_ref.iri`, so one ontology can map onto models of several datasources; a datasource loads the mappings whose model is in its own directory. Only the [`ontology_analyst`](../subagent/ontology_analyst.md) subagent loads them, unless a datasource has no model file and its only models are inline in mapping documents.
+
+## Agent features
+
+Agent uses Dosi to discover semantic models, metrics, and metric-specific dimensions; compile and execute metric queries; validate exact model artifacts; and run native attribution. The `semantic_modeling` workflow uses the native authoring contract and validation. Explorer reads, writes, and deletes metric nodes in OSI YAML files, then synchronizes the affected Knowledge Base entries. The external Dosi CLI, REST server, and MCP server are outside Agent's integration.
+
+Each model file has its own engine instance. The runtime refreshes it after the model file changes. Dosi handles SQL dialects and query planning; Agent supplies the active datasource connection and keeps subject paths in its Knowledge Base.
+
+## Dashboard Metric Queries
+
+IDE previews compile saved metric queries against the project's current Semantic Model. Editing a metric or upgrading its file format does not require regenerating the dashboard query.
+
+Published dashboards compile against the model snapshot saved with the artifact. Project model edits do not change their calculation definitions. Dosi can upgrade a frozen model's file format in the temporary execution directory without invalidating the query.

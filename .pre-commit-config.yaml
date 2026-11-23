@@ -1,0 +1,17 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.6
+    hooks:
+      - id: ruff-format
+        exclude: ^mcp/
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+        exclude: ^mcp/
+  - repo: local
+    hooks:
+      - id: tool-capability-catalog
+        name: Generate tool capability catalog
+        entry: python manager/tools/registry/catalog_builder.py
+        language: system
+        files: ^manager/.*\.(py|json)$
+        pass_filenames: false

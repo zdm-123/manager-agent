@@ -1,0 +1,12 @@
+version: 1
+entries:
+  - id: litellm-async-pending-task-teardown
+    type: log_pattern
+    pattern: "Task was destroyed but it is pending"
+    owner: agent-runtime
+    layer: product_e2e
+    reason: Async teardown warning still recurs after real LLM/tool streaming (8-11 hits per nightly run, 2026-09-06); classify until root cause is fixed.
+    allowed_until: 2026-12-05
+    allowed_in:
+      - nightly
+    action: classify_warning

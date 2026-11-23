@@ -1,0 +1,375 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+import pytest
+
+from manager.utils import trace_context as trace_context_module
+from manager.utils.trace_context import (
+    TRACE_IDENTITY_ATTRIBUTE_PREFIX,
+    build_benchmark_trace_context,
+    build_bootstrap_trace_context,
+    build_chat_trace_context,
+    build_trace_span_attributes,
+    build_workflow_trace_context_from_runner,
+    resolve_trace_identity,
+    set_trace_identity_provider,
+    trace_context,
+)
+
+
+@pytest.mark.asyncio
+async def test_host_run_scope_pins_snapshot_across_async_tasks_threads_and_nested_context(monkeypatch):
+    snapshot = ContextVar("test_trace_snapshot", default=None)
+    revision = 1
+    entered = []
+    exited = []
+
+    @contextmanager
+    def run_scope():
+        entered.append(revision)
+        token = snapshot.set(revision)
+        try:
+            yield
+        finally:
+            exited.append(snapshot.get())
+            snapshot.reset(token)
+
+    monkeypatch.setattr(trace_context_module, "_TRACE_RUN_SCOPE_PROVIDER", None, raising=False)
+    trace_context_module.set_trace_run_scope_provider(run_scope)
+    first = build_chat_trace_context(session_id="first", node_name="chat")
+    second = build_chat_trace_context(session_id="second", node_name="chat")
+
+    async def read_snapshot():
+        await asyncio.sleep(0)
+        return snapshot.get()
+
+    with trace_context(first):
+        assert snapshot.get() == 1
+        revision = 2
+        with trace_context(second):
+            assert snapshot.get() == 1
+        assert await asyncio.create_task(read_snapshot()) == 1
+        assert await asyncio.to_thread(snapshot.get) == 1
+    assert snapshot.get() is None
+    with trace_context(second):
+        assert snapshot.get() == 2
+    assert snapshot.get() is None
+    assert entered == [1, 2]
+    assert exited == [1, 2]
+
+
+@pytest.mark.parametrize("failure", ["factory", "enter", "exit"])
+def test_broken_host_run_scope_does_not_fail_run_or_replace_business_exception(monkeypatch, failure):
+    @contextmanager
+    def scope():
+        """Inject the selected host failure at context entry or cleanup."""
+        if failure == "enter":
+            raise RuntimeError("private host failure")
+        try:
+            yield
+        finally:
+            if failure == "exit":
+                raise RuntimeError("private host failure")
+
+    def factory():
+        """Fail before context creation or supply the boundary-failing scope."""
+        if failure == "factory":
+            raise RuntimeError("private host failure")
+        return scope()
+
+    monkeypatch.setattr(trace_context_module, "_TRACE_RUN_SCOPE_PROVIDER", None, raising=False)
+    trace_context_module.set_trace_run_scope_provider(factory)
+    ctx = build_chat_trace_context(session_id="run", node_name="chat")
+    with trace_context(ctx):
+        result = "answer"
+    assert result == "answer"
+    error = ValueError("business failure")
+    with pytest.raises(ValueError) as caught, trace_context(ctx):
+        raise error
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
+async def test_host_run_scope_spans_async_generator_until_close(monkeypatch):
+    from manager.utils.traceable_utils import optional_traceable
+
+    active = ContextVar("test_active_scope", default=False)
+    completed = []
+
+    @contextmanager
+    def scope():
+        token = active.set(True)
+        try:
+            yield
+        finally:
+            active.reset(token)
+            completed.append(True)
+
+    monkeypatch.setattr(trace_context_module, "_TRACE_RUN_SCOPE_PROVIDER", None, raising=False)
+    trace_context_module.set_trace_run_scope_provider(scope)
+
+    @optional_traceable(context_builder=lambda: build_chat_trace_context(session_id="stream", node_name="chat"))
+    async def stream():
+        assert active.get() is True
+        yield "first"
+        await asyncio.sleep(0)
+        assert active.get() is True
+        yield "second"
+
+    result = stream()
+    assert await anext(result) == "first"
+    assert completed == []
+    assert await anext(result) == "second"
+    await result.aclose()
+    assert completed == [True]
+    assert active.get() is False
+
+
+def test_benchmark_context_uses_run_id_as_session_group():
+    ctx = build_benchmark_trace_context(
+        benchmark="baisheng",
+        run_id="semantic_model_20260520_054027",
+        task_id="1",
+        workflow="baisheng_semantic_model",
+        datasource="starrocks",
+    )
+
+    assert ctx.name == "benchmark/baisheng/semantic_model/task-1"
+    assert ctx.session_id == "benchmark:semantic_model_20260520_054027"
+    assert "task:1" in ctx.tags
+    assert ctx.metadata["benchmark_run_id"] == "semantic_model_20260520_054027"
+    assert ctx.metadata["context_type"] == "semantic_model"
+
+
+def test_bootstrap_context_names_datasource_and_components():
+    ctx = build_bootstrap_trace_context(
+        datasource="starrocks",
+        components=["metadata", "semantic_model"],
+        strategy="incremental",
+        stream_id="stream-1",
+    )
+
+    assert ctx.name == "bootstrap-kb/starrocks/metadata+semantic_model"
+    assert ctx.session_id == "bootstrap:stream-1"
+    assert "component:metadata" in ctx.tags
+    assert ctx.metadata["components"] == ["metadata", "semantic_model"]
+
+
+def test_generated_session_ids_keep_operation_prefixes():
+    benchmark_ctx = build_benchmark_trace_context(
+        benchmark="baisheng",
+        run_id="",
+        task_id="1",
+    )
+    bootstrap_ctx = build_bootstrap_trace_context(
+        datasource="starrocks",
+        components=["metadata"],
+    )
+
+    assert benchmark_ctx.session_id.startswith("benchmark:20")
+    assert not benchmark_ctx.session_id.startswith("benchmark:cli:")
+    assert bootstrap_ctx.session_id.startswith("bootstrap:20")
+    assert not bootstrap_ctx.session_id.startswith("bootstrap:cli:")
+
+
+def test_workflow_context_uses_workflow_operation_prefix():
+    class Args:
+        workflow = None
+        datasource = "starrocks"
+
+    class Config:
+        current_datasource = "mysql"
+        home = "/tmp/manager"
+
+    class Runner:
+        args = Args()
+        global_config = Config()
+        run_id = "run-1"
+
+    ctx = build_workflow_trace_context_from_runner(Runner())
+
+    assert ctx.name == "workflow/default"
+    assert ctx.session_id == "workflow:run:run-1"
+    assert "workflow" in ctx.tags
+    assert "workflow:default" in ctx.tags
+    assert "cli" not in ctx.tags
+    assert ctx.metadata["manager_component"] == "workflow_run"
+    assert ctx.metadata["workflow"] == "default"
+
+
+def test_chat_context_uses_chat_session_as_group_not_name():
+    ctx = build_chat_trace_context(
+        session_id="gen_sql_summary_session_ab12cd34",
+        llm_session_id="gen_sql_summary_session_ab12cd34",
+        node_name="gen_sql_summary",
+        datasource="starrocks",
+    )
+
+    assert ctx.name == "agent/gen_sql_summary"
+    assert ctx.session_id == "gen_sql_summary_session_ab12cd34"
+    assert "gen_sql_summary_session_ab12cd34" not in ctx.name
+    assert ctx.metadata["service_session_id"] == "gen_sql_summary_session_ab12cd34"
+
+
+def test_agents_run_config_does_not_repeat_trace_leaf_agent_name():
+    cases = [
+        ("chat", "agent/chat"),
+        ("chatbot", "agent/chatbot"),
+    ]
+    for agent_name, expected_name in cases:
+        ctx = build_chat_trace_context(
+            session_id=f"{agent_name}_session_ab12cd34",
+            llm_session_id=f"{agent_name}_session_ab12cd34",
+            node_name=agent_name,
+        )
+
+        kwargs = ctx.agents_run_config_kwargs(agent_name=agent_name)
+
+        assert ctx.name == expected_name
+        assert kwargs["workflow_name"] == expected_name
+        assert kwargs["group_id"] == f"{agent_name}_session_ab12cd34"
+        assert kwargs["trace_metadata"]["agent_name"] == agent_name
+
+
+def test_agents_run_config_appends_distinct_agent_name():
+    ctx = build_benchmark_trace_context(
+        benchmark="baisheng",
+        run_id="semantic_model_20260520_054027",
+        task_id="1",
+        workflow="baisheng_semantic_model",
+    )
+
+    kwargs = ctx.agents_run_config_kwargs(agent_name="gen_sql")
+
+    assert kwargs["workflow_name"] == "benchmark/baisheng/semantic_model/task-1/gen_sql"
+    assert kwargs["group_id"] == "benchmark:semantic_model_20260520_054027"
+    assert kwargs["trace_metadata"]["agent_name"] == "gen_sql"
+
+
+def test_trace_span_attributes_include_provider_neutral_identity():
+    ctx = build_chat_trace_context(
+        session_id="gen_sql_summary_session_ab12cd34",
+        llm_session_id="gen_sql_summary_session_ab12cd34",
+        node_name="gen_sql_summary",
+        user_id="user-1",
+        datasource="starrocks",
+        extra={"run_id": "run-1"},
+    )
+
+    with trace_context(ctx, replace=True):
+        attrs = build_trace_span_attributes(operation="gen_sql_summary", run_type="llm")
+
+    assert attrs["manager.operation"] == "gen_sql_summary"
+    assert attrs["manager.run_type"] == "llm"
+    assert attrs["manager.trace.name"] == "agent/gen_sql_summary"
+    assert attrs["manager.session_id"] == "gen_sql_summary_session_ab12cd34"
+    assert attrs["manager.user_id"] == "user-1"
+    assert attrs["manager.run_id"] == "run-1"
+    assert attrs["manager.metadata.service_session_id"] == "gen_sql_summary_session_ab12cd34"
+
+
+def test_trace_span_attributes_normalize_complex_metadata_values():
+    ctx = build_chat_trace_context(
+        session_id="chat_session_ab12cd34",
+        node_name="chat",
+        extra={"payload": {"tables": ["schools"]}, "attempt": 2},
+    )
+
+    attrs = build_trace_span_attributes(operation="chat", run_type="llm", ctx=ctx)
+
+    assert attrs["manager.metadata.payload"] == '{"tables": ["schools"]}'
+    assert attrs["manager.metadata.attempt"] == 2
+
+
+def test_chat_context_carries_agent_owned_join_keys():
+    """max_turns and release are Manager' own facts and stay first-class."""
+    ctx = build_chat_trace_context(
+        session_id="chat_session_1",
+        node_name="olist_order_analyst",
+        user_id="u1",
+        max_turns=30,
+        release="0.4.0",
+    )
+
+    assert ctx.metadata["max_turns"] == 30
+    assert ctx.metadata["release"] == "0.4.0"
+    assert ctx.metadata["node_name"] == "olist_order_analyst"
+
+
+def test_chat_context_forwards_host_identity_verbatim():
+    """Manager must not interpret the host's identity fields, only carry them."""
+    ctx = build_chat_trace_context(
+        session_id="chat_session_1",
+        node_name="chat",
+        identity={"workspace_id": "ws_abc", "tenant": "acme"},
+    )
+
+    assert ctx.identity == {"workspace_id": "ws_abc", "tenant": "acme"}
+    # Tags are the only filterable trace field, so each identity field is tagged
+    # under the host's own key -- no Manager-side vocabulary.
+    assert "workspace_id:ws_abc" in ctx.tags
+    assert "tenant:acme" in ctx.tags
+
+
+def test_chat_context_without_a_host_carries_no_identity():
+    """A plain OSS install registers no provider and must produce no empty tags."""
+    ctx = build_chat_trace_context(session_id="chat_session_1", node_name="chat")
+
+    assert ctx.identity == {}
+    assert ctx.tags == ("chat", "agent:chat")
+
+
+def test_identity_reaches_span_attributes_under_its_own_namespace():
+    """Exporters forward this prefix wholesale; a field that stops here is lost."""
+    ctx = build_chat_trace_context(
+        session_id="chat_session_1",
+        node_name="chat",
+        max_turns=30,
+        identity={"workspace_id": "ws_abc", "request_trace_id": "abc123"},
+    )
+    attrs = build_trace_span_attributes(operation="chat", ctx=ctx)
+
+    assert attrs[f"{TRACE_IDENTITY_ATTRIBUTE_PREFIX}workspace_id"] == "ws_abc"
+    assert attrs[f"{TRACE_IDENTITY_ATTRIBUTE_PREFIX}request_trace_id"] == "abc123"
+    assert attrs["manager.metadata.max_turns"] == 30
+
+
+class TestTraceIdentityProvider:
+    """The host names its runs; Manager only asks."""
+
+    def teardown_method(self):
+        set_trace_identity_provider(None)
+
+    def test_no_provider_means_no_identity(self):
+        set_trace_identity_provider(None)
+        assert resolve_trace_identity() == {}
+
+    def test_provider_reads_the_hosts_own_request_state(self):
+        """The hook takes no arguments; a contextvar the host set is still visible."""
+        import contextvars
+
+        host_var = contextvars.ContextVar("host_request", default=None)
+        set_trace_identity_provider(lambda: {"workspace_id": host_var.get()})
+
+        host_var.set("ws_abc")
+        assert resolve_trace_identity() == {"workspace_id": "ws_abc"}
+
+    def test_values_are_coerced_and_blanks_dropped(self):
+        set_trace_identity_provider(lambda: {"a": 7, "b": None, "c": "  ", "d": " x "})
+        assert resolve_trace_identity() == {"a": "7", "d": "x"}
+
+    def test_a_broken_provider_costs_identity_not_the_run(self):
+        def boom():
+            raise RuntimeError("host hook is broken")
+
+        set_trace_identity_provider(boom)
+        assert resolve_trace_identity() == {}
+
+    def test_a_provider_returning_junk_is_ignored(self):
+        set_trace_identity_provider(lambda: "not a mapping")
+        assert resolve_trace_identity() == {}

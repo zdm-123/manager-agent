@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="https://docs.datus.ai/assets/logo-light.png" />
+  <title>Manager Report — __MANAGER_REPORT_TITLE__</title>
+  <link rel="stylesheet" href="__MANAGER_REPORT_CSS_URL__" />
+  <style>
+    /*
+     * Palette mirrors packages/web-common/src/common/styles/theme/{light,dark}.less
+     * so the loading + error states match the theme that the bundled CSS
+     * will apply once it kicks in. We can't depend on the `html[data-theme]`
+     * tokens here because the CSS bundle may still be in flight while this
+     * fallback renders — keep the literal values in sync by hand.
+     */
+    :root {
+      --manager-fallback-bg: #ffffff;          /* --app-background */
+      --manager-fallback-fg: #404040;          /* --text-primary */
+      --manager-fallback-fg-soft: #808080;     /* --text-secondary */
+      --manager-fallback-accent: #6051F5;      /* --primary-color */
+      --manager-fallback-accent-soft: rgba(96, 81, 245, 0.15);
+      --manager-fallback-error-fg: #E05252;    /* --color-red */
+      --manager-fallback-error-bg: rgba(224, 82, 82, 0.06);
+      --manager-fallback-error-border: rgba(224, 82, 82, 0.22);
+      --manager-fallback-code-bg: #F7F7F7;     /* --background-code */
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --manager-fallback-bg: #222222;
+        --manager-fallback-fg: #d6d6d6;
+        --manager-fallback-fg-soft: #8a8a8a;
+        --manager-fallback-accent: #6051F5;
+        --manager-fallback-accent-soft: rgba(96, 81, 245, 0.22);
+        --manager-fallback-error-fg: #E05252;
+        --manager-fallback-error-bg: rgba(224, 82, 82, 0.10);
+        --manager-fallback-error-border: rgba(224, 82, 82, 0.32);
+        --manager-fallback-code-bg: #1e1e1e;
+      }
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--manager-fallback-bg);
+      color: var(--manager-fallback-fg);
+    }
+    #root { height: 100vh; overflow: auto; }
+
+    /* ---------- Loading ---------- */
+
+    .manager-loading {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      padding: 32px;
+    }
+    .manager-loading-spinner {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 3px solid var(--manager-fallback-accent-soft);
+      border-top-color: var(--manager-fallback-accent);
+      animation: manager-spin 0.9s linear infinite;
+    }
+    .manager-loading-text {
+      font-size: 14px;
+      letter-spacing: 0.04em;
+      color: var(--manager-fallback-fg-soft);
+    }
+    .manager-loading-text::after {
+      /* Animated ellipsis trailing the label — adds life without a second
+         element. Three steps so each dot appears in turn. */
+      content: '';
+      display: inline-block;
+      width: 1.2em;
+      text-align: left;
+      animation: manager-dots 1.5s steps(4, end) infinite;
+    }
+    @keyframes manager-spin {
+      to { transform: rotate(360deg); }
+    }
+    @keyframes manager-dots {
+      0%   { content: ''; }
+      25%  { content: '.'; }
+      50%  { content: '..'; }
+      75%  { content: '...'; }
+      100% { content: ''; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .manager-loading-spinner { animation-duration: 3s; }
+      .manager-loading-text::after { animation: none; content: '…'; }
+    }
+
+    /* ---------- Error ---------- */
+
+    .manager-error {
+      max-width: 720px;
+      margin: 48px auto;
+      padding: 24px 28px;
+      border-radius: 12px;
+      border: 1px solid var(--manager-fallback-error-border);
+      background: var(--manager-fallback-error-bg);
+      line-height: 1.6;
+    }
+    .manager-error-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .manager-error-header svg {
+      width: 20px;
+      height: 20px;
+      color: var(--manager-fallback-error-fg);
+      flex-shrink: 0;
+    }
+    .manager-error-header h2 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--manager-fallback-error-fg);
+    }
+    .manager-error p {
+      margin: 0 0 12px 0;
+      font-size: 14px;
+      color: var(--manager-fallback-fg);
+    }
+    .manager-error code {
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--manager-fallback-code-bg);
+      font-family: 'SFMono-Regular', 'Menlo', monospace;
+      font-size: 13px;
+      word-break: break-all;
+    }
+    .manager-error-details {
+      margin-top: 16px;
+    }
+    .manager-error-details summary {
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--manager-fallback-fg-soft);
+      user-select: none;
+    }
+    .manager-error pre {
+      margin: 12px 0 0 0;
+      padding: 12px 14px;
+      background: var(--manager-fallback-code-bg);
+      border-radius: 8px;
+      max-height: 320px;
+      overflow: auto;
+      font-family: 'SFMono-Regular', 'Menlo', monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div id="manager-loading" class="manager-loading" role="status" aria-live="polite">
+      <div class="manager-loading-spinner" aria-hidden="true"></div>
+      <div class="manager-loading-text">Loading Manager Report</div>
+    </div>
+    <div id="manager-error" class="manager-error" hidden>
+      <div class="manager-error-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="12" y1="8" x2="12" y2="12"></line>
+          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+        </svg>
+        <h2>Failed to load Manager Report</h2>
+      </div>
+      <p>
+        If this page stays blank, your environment cannot reach
+        <code>__MANAGER_REPORT_JS_URL__</code>.
+      </p>
+      <p>
+        Use the CLI's <code>--report-dist</code> flag to point at a local copy
+        of the renderer, or open this file in an environment with network access
+        to the host above.
+      </p>
+      <details class="manager-error-details">
+        <summary>Show raw artifact JSON</summary>
+        <pre id="manager-report-fallback-pre"></pre>
+      </details>
+    </div>
+  </div>
+
+  <script type="application/json" id="manager-report-data">__MANAGER_REPORT_DATA__</script>
+
+  <script>
+    (function () {
+      // Swap the centered spinner for the error card. Called by both the
+      // script-tag onerror (network/CSP failure) and the post-load inline
+      // check (UMD loaded but ManagerArtifact never attached / initReport
+      // threw). Idempotent so a double trigger is harmless.
+      window.__managerShowReportError = function () {
+        var loading = document.getElementById('manager-loading');
+        var err = document.getElementById('manager-error');
+        if (loading) loading.style.display = 'none';
+        if (err && err.hidden) {
+          err.hidden = false;
+          var pre = document.getElementById('manager-report-fallback-pre');
+          var data = document.getElementById('manager-report-data');
+          if (pre && data) pre.textContent = data.textContent || '';
+        }
+      };
+    })();
+  </script>
+
+  <script src="__MANAGER_REPORT_JS_URL__"
+          onerror="window.__managerShowReportError && window.__managerShowReportError();"></script>
+  <script>
+    (function () {
+      if (window.ManagerArtifact && typeof window.ManagerArtifact.initReport === 'function') {
+        try {
+          window.ManagerArtifact.initReport({
+            rootId: 'root',
+            dataScriptId: 'manager-report-data'
+          });
+          // Successful mount: React replaces #root's children, so the
+          // loading state vanishes naturally. Nothing to do here.
+        } catch (e) {
+          window.__managerShowReportError && window.__managerShowReportError();
+        }
+      } else {
+        window.__managerShowReportError && window.__managerShowReportError();
+      }
+    })();
+  </script>
+</body>
+</html>

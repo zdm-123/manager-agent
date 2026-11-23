@@ -1,0 +1,842 @@
+"""
+Test cases for manager/tools/func_tool/base.py
+Focuses on trans_to_function_tool argument validation for LLM tool calls.
+"""
+
+import asyncio
+import json
+import threading
+from types import SimpleNamespace
+from typing import Any, Optional
+from unittest.mock import MagicMock
+
+import pytest
+from agents import Agent, Runner, SQLiteSession
+from agents.exceptions import UserError
+from agents.items import ToolCallItem
+from agents.models.interface import Model
+from agents.run import RunConfig
+from agents.usage import Usage
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
+
+from manager.tools.func_tool.base import FuncToolListResult, FuncToolResult, tool_schema, trans_to_function_tool
+from manager.tools.func_tool.filesystem_tools import FilesystemFuncTool
+from manager.tools.permission.permission_hooks import PermissionHooks
+from manager.tools.permission.permission_manager import PermissionManager
+from manager.tools.permission.profiles import get_profile
+from manager.tools.registry.contracts import tool_contract
+from manager.tools.registry.tool_registry import ToolRegistry
+
+
+class TestTransToFunctionTool:
+    """Tests for trans_to_function_tool and its argument validation."""
+
+    def _make_tool_from_method(self, method):
+        """Helper to create a FunctionTool from a bound method."""
+        return trans_to_function_tool(method)
+
+    @pytest.mark.asyncio
+    async def test_method_schema_declaration_preserves_dynamic_bindings(self):
+        class ParameterTool:
+            @tool_schema(strict_mode=False)
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def query(self, params: dict[str, Any]) -> FuncToolResult:
+                return FuncToolResult(result=params)
+
+        class InheritedTool(ParameterTool):
+            pass
+
+        instance = InheritedTool()
+        params = {"regions": ["APAC", "EMEA"], "threshold": 100, "enabled": False}
+        assert instance.query(params).result == params
+        tool = trans_to_function_tool(instance.query)
+        assert tool.strict_json_schema is False
+        assert tool.params_json_schema["properties"]["params"]["additionalProperties"] is True
+        assert "self" not in tool.params_json_schema["properties"]
+        result = await tool.on_invoke_tool(None, json.dumps({"params": params}))
+        assert result == {"success": 1, "error": None, "result": params}
+
+    def test_undeclared_methods_keep_strict_schema(self):
+        class ParameterTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def query(self, params: dict[str, Any]) -> FuncToolResult:
+                return FuncToolResult(result=params)
+
+        with pytest.raises(UserError, match="additionalProperties should not be set"):
+            trans_to_function_tool(ParameterTool().query)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("encoded", [False, True])
+    async def test_declared_array_and_boolean_arguments_execute_and_replay_canonically(self, encoded):
+        """Normalize encoded arrays and booleans before execution and replay."""
+
+        class MetadataTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def inspect(self, tables: list[str], include_views: Optional[bool] = None) -> FuncToolResult:
+                return FuncToolResult(result={"tables": tables, "include_views": include_views})
+
+        expected = {"tables": ["orders", "customers"], "include_views": False}
+        arguments = {k: json.dumps(v) for k, v in expected.items()} if encoded else expected
+        raw = json.dumps(arguments)
+        context = SimpleNamespace(tool_arguments=raw, tool_call={"arguments": raw})
+        result = await trans_to_function_tool(MetadataTool().inspect).on_invoke_tool(context, raw)
+        assert result["success"] == 1 and result["result"] == expected
+        assert json.loads(context.tool_arguments) == expected
+        assert context.tool_call["arguments"] == context.tool_arguments
+
+    @pytest.mark.asyncio
+    async def test_text_and_ambiguous_argument_types_preserve_their_values(self):
+        """Preserve strings when the schema does not unambiguously require decoding."""
+
+        class TextTool:
+            @tool_schema(strict_mode=False)
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def inspect(
+                self, text: str, choice: str | list[str], flag: str | bool, payload: dict[str, Any]
+            ) -> FuncToolResult:
+                return FuncToolResult(result={"text": text, "choice": choice, "flag": flag, "payload": payload})
+
+        arguments = {
+            "text": "SELECT 'false', '[1, 2]'",
+            "choice": '["orders"]',
+            "flag": "false",
+            "payload": {"tables": '["orders"]', "enabled": "false"},
+        }
+        result = await trans_to_function_tool(TextTool().inspect).on_invoke_tool(None, json.dumps(arguments))
+        assert result["success"] == 1 and result["result"] == arguments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"tables": "orders", "enabled": "true"},
+            {"tables": '{"name":"orders"}', "enabled": "true"},
+            {"tables": "[123]", "enabled": "true"},
+            {"tables": '["orders"]', "enabled": "yes"},
+            {"tables": '["orders"]', "enabled": 1},
+        ],
+    )
+    async def test_encoded_arguments_still_require_strict_validation(self, arguments):
+        """Reject invalid decoded values before invoking the tool implementation."""
+
+        class MetadataTool:
+            called = False
+
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def inspect(self, tables: list[str], enabled: bool) -> FuncToolResult:
+                self.called = True
+                return FuncToolResult(result=tables)
+
+        instance = MetadataTool()
+        result = await trans_to_function_tool(instance.inspect).on_invoke_tool(None, json.dumps(arguments))
+        assert result["success"] == 0 and result["result"]["argument_errors"]
+        assert instance.called is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [[123], "one-id"])
+    async def test_wrong_array_types_return_parameter_locations_without_execution(self, value):
+        """Report precise array validation locations without calling the implementation."""
+
+        class EvidenceTool:
+            called = False
+
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def expand(self, output_ids: list[str]) -> FuncToolResult:
+                self.called = True
+                return FuncToolResult(result=output_ids)
+
+        instance = EvidenceTool()
+        result = await trans_to_function_tool(instance.expand).on_invoke_tool(None, json.dumps({"output_ids": value}))
+        assert not instance.called and result["success"] == 0
+        assert result["result"]["argument_errors"][0]["parameter"].startswith("output_ids")
+
+    @pytest.mark.parametrize("declared_strict", [True, False])
+    @pytest.mark.parametrize("override_strict", [True, False])
+    def test_explicit_schema_mode_overrides_method_declaration(self, declared_strict, override_strict):
+        class ParameterTool:
+            @tool_schema(strict_mode=declared_strict)
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def query(self, name: str) -> FuncToolResult:
+                return FuncToolResult(result=name)
+
+        tool = trans_to_function_tool(ParameterTool().query, strict_mode=override_strict)
+        assert tool.strict_json_schema is override_strict
+        assert tool.params_json_schema.get("additionalProperties", True) is not override_strict
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_parameters_without_executing(self):
+        """A mistyped filter must not disappear from a successful query."""
+
+        class FakeTool:
+            called = False
+
+            @tool_contract(access="read", direct_call=True, category="db_tools")
+            def search_table(self, query_text: str, top_n: int = 5) -> FuncToolResult:
+                self.called = True
+                return FuncToolResult(result={"query_text": query_text, "top_n": top_n})
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.search_table)
+
+        # Simulate LLM sending an extra 'database_type' parameter
+        unknown = {"database_type": "sqlite", "fake_filter": "x"}
+        args = json.dumps({"query_text": "test query", **unknown})
+        result = await tool.on_invoke_tool(None, args)
+
+        assert result["success"] == 0
+        assert all(name in result["error"] for name in unknown)
+        assert result["result"] is None
+        assert not fake.called
+
+    @pytest.mark.asyncio
+    async def test_valid_parameters_pass_through(self):
+        """All valid parameters should be passed through correctly."""
+
+        class FakeTool:
+            @tool_contract(access="read", direct_call=True, category="db_tools")
+            def search_table(self, query_text: str, top_n: int = 5) -> FuncToolResult:
+                return FuncToolResult(result={"query_text": query_text, "top_n": top_n})
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.search_table)
+
+        args = json.dumps({"query_text": "hello", "top_n": 10})
+        result = await tool.on_invoke_tool(None, args)
+
+        assert result["success"] == 1
+        assert result["result"]["query_text"] == "hello"
+        assert result["result"]["top_n"] == 10
+
+    @pytest.mark.asyncio
+    async def test_empty_args(self):
+        """Empty arguments should work without errors."""
+
+        class FakeTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def no_args_method(self) -> FuncToolResult:
+                return FuncToolResult(result="ok")
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.no_args_method)
+
+        result = await tool.on_invoke_tool(None, "")
+        assert result["success"] == 1
+        assert result["result"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_error(self):
+        """Invalid JSON should return an error result."""
+
+        class FakeTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def some_method(self, x: str) -> FuncToolResult:
+                return FuncToolResult(result=x)
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.some_method)
+
+        result = await tool.on_invoke_tool(None, "not-valid-json{")
+        assert result["success"] == 0
+        assert "Invalid JSON" in result["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("second_path", ["SKILL.md", "unexpected.md"])
+    async def test_duplicate_paths_do_not_write_either_file(self, tmp_path, second_path):
+        original = tmp_path / "SKILL.md"
+        original.write_text("original", encoding="utf-8")
+        filesystem = FilesystemFuncTool(root_path=str(tmp_path))
+        tool = self._make_tool_from_method(filesystem.write_file)
+        raw_args = f'{{"path":"SKILL.md","content":"replacement","path":"{second_path}"}}'
+        context = SimpleNamespace(tool_arguments=raw_args, tool_call={"arguments": raw_args})
+
+        result = await tool.on_invoke_tool(context, raw_args)
+
+        assert result["success"] == 0
+        assert "Duplicate JSON key 'path'" in result["error"]
+        assert "not executed" in result["error"]
+        assert "Retry" in result["error"]
+        assert original.read_text(encoding="utf-8") == "original"
+        assert not (tmp_path / "unexpected.md").exists()
+        assert context.tool_arguments == "{}"
+        assert context.tool_call["arguments"] == "{}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_args", "duplicate_key"),
+        [
+            ('{"payload":{"path":"first","path":"second"}}', "path"),
+            ('{"payload":{"items":[{"id":1,"id":2}]}}', "id"),
+            (r'{"payload":{"path":"first","p\u0061th":"second"}}', "path"),
+        ],
+    )
+    async def test_duplicate_nested_keys_do_not_execute(self, raw_args, duplicate_key):
+        class PayloadTool:
+            called = False
+
+            @tool_schema(strict_mode=False)
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def inspect(self, payload: dict[str, Any]) -> FuncToolResult:
+                self.called = True
+                return FuncToolResult(result=payload)
+
+        instance = PayloadTool()
+        result = await self._make_tool_from_method(instance.inspect).on_invoke_tool(None, raw_args)
+
+        assert result["success"] == 0
+        assert f"Duplicate JSON key {duplicate_key!r}" in result["error"]
+        assert not instance.called
+
+    @pytest.mark.asyncio
+    async def test_duplicate_keys_in_encoded_array_do_not_execute(self):
+        class RecordsTool:
+            called = False
+
+            @tool_schema(strict_mode=False)
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def inspect(self, records: list[dict[str, str]]) -> FuncToolResult:
+                self.called = True
+                return FuncToolResult(result=records)
+
+        instance = RecordsTool()
+        raw_args = json.dumps({"records": '[{"path":"first","path":"second"}]'})
+        context = SimpleNamespace(tool_arguments=raw_args, tool_call={"arguments": raw_args})
+
+        result = await self._make_tool_from_method(instance.inspect).on_invoke_tool(context, raw_args)
+
+        assert result["success"] == 0
+        assert "Duplicate JSON key 'path'" in result["error"]
+        assert not instance.called
+        assert context.tool_arguments == "{}"
+        assert context.tool_call["arguments"] == "{}"
+
+    @pytest.mark.asyncio
+    async def test_repeated_keys_in_separate_objects_and_json_text_are_preserved(self):
+        class PayloadTool:
+            @tool_schema(strict_mode=False)
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def inspect(self, payload: dict[str, Any], content: str) -> FuncToolResult:
+                return FuncToolResult(result={"payload": payload, "content": content})
+
+        arguments = {
+            "payload": {"items": [{"path": "first"}, {"path": "second"}]},
+            "content": '{"path":"first","path":"second"}',
+        }
+        raw_args = json.dumps(arguments)
+        context = SimpleNamespace(tool_arguments=raw_args, tool_call={"arguments": raw_args})
+
+        result = await self._make_tool_from_method(PayloadTool().inspect).on_invoke_tool(context, raw_args)
+
+        assert result == {"success": 1, "error": None, "result": arguments}
+        assert context.tool_arguments == raw_args
+
+    @pytest.mark.asyncio
+    async def test_repairs_arguments_for_replay_without_executing(self):
+        """Repair malformed arguments for replay, then execute only a valid retry."""
+
+        class FakeTool:
+            def __init__(self):
+                self.received = None
+
+            @tool_contract(access="sql", direct_call=True, category="db_tools")
+            def execute_sql(
+                self,
+                sql: str,
+                datasource: str = "",
+                database: str = "",
+                min_rows: Optional[int] = None,
+                max_rows: Optional[int] = None,
+            ) -> FuncToolResult:
+                self.received = {
+                    "sql": sql,
+                    "datasource": datasource,
+                    "database": database,
+                    "min_rows": min_rows,
+                    "max_rows": max_rows,
+                }
+                return FuncToolResult(result="ok")
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.execute_sql)
+        raw_args = '{"sql":"SELECT 1","datasource":"njtest","database":"njyh","min_rows":,"max_rows":}'
+        raw_tool_call = ResponseFunctionToolCall(
+            arguments=raw_args,
+            call_id="call_repaired",
+            name="execute_sql",
+            type="function_call",
+        )
+        tool_ctx = SimpleNamespace(tool_arguments=raw_args, tool_call=raw_tool_call)
+
+        result = await tool.on_invoke_tool(tool_ctx, raw_args)
+
+        assert result["success"] == 0
+        assert "not executed" in result["error"]
+        assert "Retry" in result["error"]
+        assert fake.received is None
+        written_args = json.loads(tool_ctx.tool_arguments)
+        assert written_args["sql"] == "SELECT 1"
+        assert {"min_rows", "max_rows"} <= written_args.keys()
+        assert json.loads(raw_tool_call.arguments) == written_args
+
+        replayed = ToolCallItem(agent=Agent(name="test"), raw_item=raw_tool_call).to_input_item()
+        assert json.loads(replayed["arguments"])["sql"] == "SELECT 1"
+
+        retry_args = json.dumps(
+            {
+                "sql": "SELECT 1",
+                "datasource": "njtest",
+                "database": "njyh",
+                "min_rows": None,
+                "max_rows": None,
+            }
+        )
+        retry_tool_call = ResponseFunctionToolCall(
+            arguments=retry_args,
+            call_id="call_retry",
+            name="execute_sql",
+            type="function_call",
+        )
+        retry_ctx = SimpleNamespace(tool_arguments=retry_args, tool_call=retry_tool_call)
+
+        retry_result = await tool.on_invoke_tool(retry_ctx, retry_args)
+
+        assert retry_result["success"] == 1
+        assert fake.received == {
+            "sql": "SELECT 1",
+            "datasource": "njtest",
+            "database": "njyh",
+            "min_rows": None,
+            "max_rows": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_valid_json_preserves_original_arguments_string(self):
+        """A valid call should not be rewritten merely to canonicalize formatting."""
+
+        class FakeTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def some_method(self, x: str) -> FuncToolResult:
+                return FuncToolResult(result=x)
+
+        tool = self._make_tool_from_method(FakeTool().some_method)
+        raw_args = '{\n  "x": "value"\n}'
+        raw_tool_call = ResponseFunctionToolCall(
+            arguments=raw_args,
+            call_id="call_valid",
+            name="some_method",
+            type="function_call",
+        )
+        tool_ctx = SimpleNamespace(tool_arguments=raw_args, tool_call=raw_tool_call)
+
+        result = await tool.on_invoke_tool(tool_ctx, raw_args)
+
+        assert result["success"] == 1
+        assert tool_ctx.tool_arguments == raw_args
+        assert raw_tool_call.arguments == raw_args
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_args", "replayed_sql"),
+        [
+            ('{"sql":"SELECT 1","min_rows":,"max_rows":}', "SELECT 1"),
+            ('{"sql":"SELECT 1","sql":"SELECT 2","min_rows":null,"max_rows":null}', None),
+        ],
+    )
+    async def test_runner_replays_rejected_args_and_executes_only_valid_retry(self, raw_args, replayed_sql):
+        """Exercise the real Runner turn and session persistence path."""
+
+        class FakeTool:
+            def __init__(self):
+                self.calls = []
+
+            @tool_contract(access="sql", direct_call=True, category="db_tools")
+            def execute_sql(
+                self,
+                sql: str,
+                min_rows: Optional[int] = None,
+                max_rows: Optional[int] = None,
+            ) -> FuncToolResult:
+                self.calls.append((sql, min_rows, max_rows))
+                return FuncToolResult(result="ok")
+
+        class SequenceModel(Model):
+            def __init__(self):
+                self.inputs = []
+
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            async def get_response(self, system_instructions, input, *_args, **_kwargs):
+                from agents.items import ModelResponse
+
+                del system_instructions
+                self.inputs.append(input)
+                if len(self.inputs) == 1:
+                    output = [
+                        ResponseFunctionToolCall(
+                            arguments=raw_args,
+                            call_id="call_malformed",
+                            name="execute_sql",
+                            type="function_call",
+                        )
+                    ]
+                elif len(self.inputs) == 2:
+                    replayed_call = next(
+                        item for item in input if isinstance(item, dict) and item.get("call_id") == "call_malformed"
+                    )
+                    assert json.loads(replayed_call["arguments"]).get("sql") == replayed_sql
+                    rejection = next(
+                        item
+                        for item in input
+                        if isinstance(item, dict)
+                        and item.get("type") == "function_call_output"
+                        and item.get("call_id") == "call_malformed"
+                    )
+                    assert "The tool was not executed." in rejection["output"]
+                    assert "Retry" in rejection["output"]
+                    output = [
+                        ResponseFunctionToolCall(
+                            arguments='{"sql":"SELECT 1","min_rows":null,"max_rows":null}',
+                            call_id="call_retry",
+                            name="execute_sql",
+                            type="function_call",
+                        )
+                    ]
+                else:
+                    output = [
+                        ResponseOutputMessage(
+                            id="message_done",
+                            content=[
+                                ResponseOutputText(
+                                    annotations=[],
+                                    text="done",
+                                    type="output_text",
+                                )
+                            ],
+                            role="assistant",
+                            status="completed",
+                            type="message",
+                        )
+                    ]
+                return ModelResponse(output=output, usage=Usage(), response_id=None)
+
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            async def stream_response(self, *_args, **_kwargs):
+                if False:
+                    yield None
+
+        fake = FakeTool()
+        model = SequenceModel()
+        session = SQLiteSession("tool-args-repair", ":memory:")
+        tool = self._make_tool_from_method(fake.execute_sql)
+        registry = ToolRegistry()
+        registry.register_tools("db_tools", [tool])
+        broker = MagicMock()
+        permission_hooks = PermissionHooks(
+            broker=broker,
+            permission_manager=PermissionManager(
+                global_config=get_profile("normal"),
+                active_profile="normal",
+            ),
+            node_name="chat",
+            tool_registry=registry,
+        )
+        agent = Agent(
+            name="test",
+            model=model,
+            tools=[tool],
+            hooks=permission_hooks,
+        )
+
+        result = await Runner.run(
+            agent,
+            input="run a query",
+            max_turns=5,
+            session=session,
+            run_config=RunConfig(tracing_disabled=True),
+        )
+
+        assert result.final_output == "done"
+        assert fake.calls == [("SELECT 1", None, None)]
+        broker.request.assert_not_called()
+        saved_calls = [
+            item for item in await session.get_items() if isinstance(item, dict) and item.get("type") == "function_call"
+        ]
+        assert len(saved_calls) == 2
+        assert all(isinstance(json.loads(item["arguments"]), dict) for item in saved_calls)
+
+    @pytest.mark.asyncio
+    async def test_unrepairable_json_is_not_executed_and_writes_back_empty_object(self):
+        """An unrecoverable call must leave valid JSON for the Runner's next turn."""
+
+        class FakeTool:
+            def __init__(self):
+                self.called = False
+
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def some_method(self, x: str) -> FuncToolResult:
+                self.called = True
+                return FuncToolResult(result=x)
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.some_method)
+        raw_tool_call = ResponseFunctionToolCall(
+            arguments="not-valid-json{",
+            call_id="call_invalid",
+            name="some_method",
+            type="function_call",
+        )
+        tool_ctx = SimpleNamespace(tool_arguments=raw_tool_call.arguments, tool_call=raw_tool_call)
+
+        result = await tool.on_invoke_tool(tool_ctx, raw_tool_call.arguments)
+
+        assert result["success"] == 0
+        assert "Invalid JSON" in result["error"]
+        assert fake.called is False
+        assert tool_ctx.tool_arguments == "{}"
+        assert raw_tool_call.arguments == "{}"
+
+    @pytest.mark.asyncio
+    async def test_excluded_parameters_are_not_exposed(self):
+        """Excluded parameters should be omitted from the function-tool schema."""
+
+        class FakeTool:
+            @tool_contract(access="read", direct_call=True, category="db_tools")
+            def list_tables(self, catalog: str = "", database: str = "") -> FuncToolResult:
+                return FuncToolResult(result={"catalog": catalog, "database": database})
+
+        fake = FakeTool()
+        tool = trans_to_function_tool(fake.list_tables, excluded_params={"catalog"})
+
+        assert "catalog" not in tool.params_json_schema.get("properties", {})
+        assert "database" in tool.params_json_schema.get("properties", {})
+
+        args = json.dumps({"catalog": "cat", "database": "db"})
+        result = await tool.on_invoke_tool(None, args)
+
+        assert result["success"] == 0
+        assert result["error"] == "Unsupported parameters for this tool: catalog"
+
+    @pytest.mark.asyncio
+    async def test_missing_required_parameter_returns_recoverable_error(self):
+        """Omitting a required arg must yield a recoverable error, not a crash.
+
+        Regression: a tool call that drops a required argument (e.g. ``edit_file``
+        without ``path``) previously reached ``method_to_call(**args_dict)`` and
+        raised a raw ``TypeError`` at bind time, aborting the whole agent
+        interaction. The dispatcher now rejects it up front so the model can retry.
+        """
+
+        class FakeTool:
+            @tool_contract(access="write", direct_call=False, category="filesystem_tools")
+            def edit_file(self, path: str, old_string: str, new_string: str) -> FuncToolResult:
+                return FuncToolResult(result="edited")
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.edit_file)
+
+        args = json.dumps({"old_string": "a", "new_string": "b"})  # path omitted
+        result = await tool.on_invoke_tool(None, args)
+
+        assert result["success"] == 0
+        assert "Missing required parameter(s)" in result["error"]
+        assert "path" in result["error"]
+        assert "edit_file" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_multiple_required_parameters_are_all_reported(self):
+        """Report every missing required parameter in one recoverable tool result."""
+
+        class FakeTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def combine(self, a: str, b: str, c: int = 0) -> FuncToolResult:
+                return FuncToolResult(result="ok")
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.combine)
+
+        result = await tool.on_invoke_tool(None, json.dumps({"c": 5}))  # a, b omitted
+
+        assert result["success"] == 0
+        assert "a" in result["error"] and "b" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_all_required_present_still_runs(self):
+        """The guard must not block a well-formed call (no false positives)."""
+
+        class FakeTool:
+            @tool_contract(access="write", direct_call=False, category="filesystem_tools")
+            def edit_file(self, path: str, old_string: str, new_string: str) -> FuncToolResult:
+                return FuncToolResult(result={"path": path})
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.edit_file)
+
+        args = json.dumps({"path": "orders.yml", "old_string": "a", "new_string": "b"})
+        result = await tool.on_invoke_tool(None, args)
+
+        assert result["success"] == 1
+        assert result["result"] == {"path": "orders.yml"}
+
+    @pytest.mark.asyncio
+    async def test_optional_parameters_may_be_omitted(self):
+        """Parameters with defaults are not required and may be omitted."""
+
+        class FakeTool:
+            @tool_contract(access="read", direct_call=True, category="db_tools")
+            def search_table(self, query_text: str, top_n: int = 5) -> FuncToolResult:
+                return FuncToolResult(result={"query_text": query_text, "top_n": top_n})
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.search_table)
+
+        result = await tool.on_invoke_tool(None, json.dumps({"query_text": "hello"}))
+
+        assert result["success"] == 1
+        assert result["result"] == {"query_text": "hello", "top_n": 5}
+
+    @pytest.mark.asyncio
+    async def test_sync_tool_runs_off_the_event_loop_thread(self):
+        """Synchronous tool methods must be offloaded to a worker thread.
+
+        ``final_invoker`` is awaited directly on the asyncio event-loop thread.
+        If a blocking sync tool (e.g. a StarRocks ``list_tables`` metadata query)
+        ran inline, it would freeze the loop and make the whole server
+        unresponsive. The fix dispatches sync methods via ``asyncio.to_thread``;
+        here we assert the method body executed on a different thread.
+        """
+        loop_thread_id = threading.get_ident()
+        ran_on: dict = {}
+
+        class FakeTool:
+            @tool_contract(access="read", direct_call=True, category="db_tools")
+            def list_tables(self) -> FuncToolResult:
+                ran_on["thread_id"] = threading.get_ident()
+                return FuncToolResult(result="ok")
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.list_tables)
+
+        result = await tool.on_invoke_tool(None, "{}")
+
+        assert result["success"] == 1
+        assert ran_on["thread_id"] != loop_thread_id
+
+    @pytest.mark.asyncio
+    async def test_blocking_sync_tool_does_not_stall_the_event_loop(self):
+        """A blocking sync tool must not prevent other coroutines from running."""
+        proceed = threading.Event()
+
+        class FakeTool:
+            @tool_contract(access="restricted", direct_call=False, category="tools")
+            def slow_io(self) -> FuncToolResult:
+                # Blocks the worker thread until the event loop releases it.
+                proceed.wait(2)
+                return FuncToolResult(result="done")
+
+        fake = FakeTool()
+        tool = self._make_tool_from_method(fake.slow_io)
+
+        task = asyncio.create_task(tool.on_invoke_tool(None, "{}"))
+        # If slow_io blocked the loop, this yield would never resume and the
+        # event below would never be set (deadlock). Reaching here with the task
+        # still pending proves the loop stayed free while slow_io blocked.
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        proceed.set()
+        result = await task
+        assert result["success"] == 1
+        assert result["result"] == "done"
+
+
+class TestDataToolOutputBounds:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["export_query", "transfer_query_result"])
+    @pytest.mark.parametrize("failure", ["unknown_parameter", "duplicate_parameter", "schema", "method"])
+    async def test_all_data_tool_failure_exits_are_bounded(self, name, failure):
+        from manager.utils.bounded_tool_output import MAX_ERROR_BYTES, MAX_RESULT_BYTES
+
+        class DataTools:
+            calls = 0
+
+            @tool_contract(access="write", direct_call=False, category="db_tools")
+            def export_query(self, sql: str, output_file: str = "") -> FuncToolResult:
+                self.calls += 1
+                raise RuntimeError("driver failed [SQL: INSERT INTO orders VALUES " + "private 数据" * 200_000)
+
+            @tool_contract(access="write", direct_call=False, category="db_tools")
+            def transfer_query_result(self, source_sql: str) -> FuncToolResult:
+                self.calls += 1
+                raise RuntimeError("driver failed [SQL: INSERT INTO orders VALUES " + "private 数据" * 200_000)
+
+        instance = DataTools()
+        tool = trans_to_function_tool(getattr(instance, name))
+        sql_key = "sql" if name == "export_query" else "source_sql"
+        huge_key = "unexpected_" + "数据" * 200_000
+        arguments = {sql_key: "SELECT 1"}
+        if failure == "unknown_parameter":
+            arguments[huge_key] = "ignored"
+        elif failure == "schema":
+            arguments[sql_key] = None
+        raw = json.dumps(arguments, ensure_ascii=False)
+        if failure == "duplicate_parameter":
+            key = json.dumps(huge_key, ensure_ascii=False)
+            raw = "{" + f'{json.dumps(sql_key)}: "SELECT 1", {key}: 1, {key}: 2' + "}"
+        result = await tool.on_invoke_tool(None, raw)
+        assert result["success"] == 0
+        assert len(result["error"].encode()) <= MAX_ERROR_BYTES
+        assert len(json.dumps(result, ensure_ascii=False).encode()) <= MAX_RESULT_BYTES
+        assert instance.calls == (1 if failure == "method" else 0)
+
+
+class TestFuncToolListResult:
+    """Tests for the canonical list-shaped envelope."""
+
+    def test_defaults_empty_items_and_none_pagination(self):
+        env = FuncToolListResult()
+        assert env.items == []
+        assert env.total is None
+        assert env.has_more is None
+        assert env.extra is None
+
+    def test_serialization_round_trips_through_funcresult(self):
+        env = FuncToolListResult(
+            items=[{"id": "1", "name": "foo"}, {"id": "2", "name": "bar"}],
+            total=137,
+            has_more=True,
+            extra={"next_offset": 20},
+        )
+        outer = FuncToolResult(result=env.model_dump())
+        dumped = outer.model_dump(mode="json")
+
+        assert dumped["success"] == 1
+        assert dumped["error"] is None
+        assert dumped["result"] == {
+            "items": [{"id": "1", "name": "foo"}, {"id": "2", "name": "bar"}],
+            "total": 137,
+            "has_more": True,
+            "extra": {"next_offset": 20},
+        }
+
+    def test_items_stay_a_list_when_none_passed(self):
+        # Pydantic rejects items=None (default_factory returns []), so the
+        # "always a list" invariant is enforced at construction time.
+        with pytest.raises(ValueError):
+            FuncToolListResult(items=None)
+
+    def test_extra_accepts_arbitrary_tool_metadata(self):
+        env = FuncToolListResult(
+            items=[{"k": "v"}],
+            extra={"next_offset": 5, "cursor": "abc", "filters_applied": ["x"]},
+        )
+        assert env.extra["cursor"] == "abc"
+        assert env.extra["filters_applied"] == ["x"]
+
+    def test_empty_items_is_empty_list_not_missing(self):
+        env = FuncToolListResult(items=[], total=0, has_more=False)
+        dumped = env.model_dump()
+        assert dumped["items"] == []
+        assert dumped["total"] == 0
+        assert dumped["has_more"] is False

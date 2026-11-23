@@ -1,0 +1,114 @@
+# Install and First Query
+
+Get started with Manager Agent in minutes: install → configure → first query.
+
+!!! tip "Not sure which tutorial to follow next?"
+    Use [Choose Your Getting Started Path](index.md) to pick the guide that matches your goal.
+
+## 1. Install
+
+One-liner for Linux x86_64/aarch64 (glibc 2.28+) or Apple Silicon macOS (recommended):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install.sh | sh
+```
+
+The script bootstraps `uv`, creates a dedicated venv at `~/.manager/venv` (Python 3.12 is downloaded automatically if missing), and writes `manager`, `manager-cli`, `manager-api`, `manager-mcp`, `manager-pip`, etc. into `~/.local/bin`. The bundled `dosi-engine` currently has wheels for these platforms only. Open a new shell (or `source ~/.zshrc`) so the new PATH takes effect.
+
+??? note "Other install methods"
+    **Pin a released version** (the variable is passed to the receiving shell, not to `curl`):
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install.sh | MANAGER_VERSION=0.2.6 sh
+    ```
+
+    **From GitHub source** (unreleased changes on `main`, or any branch / tag / commit):
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install-dev.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install-dev.sh | MANAGER_REF=feature/foo sh
+    ```
+
+    **Managed Python environment** (Python 3.12 required):
+    ```bash
+    # Pick one: Conda / virtualenv / uv venv. After activating:
+    pip install manager-agent
+    ```
+
+    Other variables: `MANAGER_HOME`, `MANAGER_BIN_DIR`, `MANAGER_FORCE=1`, `MANAGER_NO_MODIFY_PATH=1`. To install extra Python packages into the same venv later, use `manager-pip install <package>`.
+
+    Pre-release builds: `pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ manager-agent`.
+
+## 2. Configure & Init
+
+Launch the REPL:
+
+```bash
+manager
+```
+
+Inside the REPL, run `/datasource`, `/model`, and `/init` in turn.
+
+### Datasource
+
+Run `/datasource`. The TUI prompts for name, type (DuckDB, SQLite, MySQL, PostgreSQL, Snowflake, StarRocks, …) and connection details, tests connectivity, and writes the result to `~/.manager/conf/agent.yml`. The same TUI also handles edit / delete / set-default / plugin install. Switch at runtime with `/datasource <name>`.
+
+!!! tip "Demo Database"
+    Manager ships with a pre-configured demo DuckDB database at `~/.manager/sample/duckdb-demo.duckdb`. In `/datasource`, pick `duckdb` and point at this path for an instant working datasource.
+
+### Model
+
+Run `/model`. The TUI lists all providers; selecting one prompts for the API key (auto-detecting common env vars). Direct shortcuts like `/model openai/gpt-4.1` are also supported.
+
+Common providers:
+
+| Provider | Default model | Env var |
+|---|---|---|
+| `openai` | `gpt-4.1` | `OPENAI_API_KEY` |
+| `deepseek` | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
+| `claude` | `claude-sonnet-4-5` | `ANTHROPIC_API_KEY` |
+| `gemini` | `gemini-2.5-pro` | `GEMINI_API_KEY` |
+
+Full provider list (Kimi / Qwen / GLM / MiniMax, Claude subscription, Codex OAuth, Coding Plan, …) lives in [Model Command](../cli/other_commands.md#model).
+
+### Init (optional)
+
+`cd` into your project, launch `manager`, and run `/init` to scan the directory and generate a project-level `AGENTS.md` using the model + datasource you saved above. To target a different datasource, run `/datasource <name>` before `/init`.
+
+## 3. Start Using Manager
+
+You'll see the startup banner and a green `>` prompt. Press **Tab** on an empty line to cycle through the three input modes — chat `>` → `sql>` → `bash>` — and **Esc** or **Ctrl+C** to return to chat:
+
+- **Chat `>`** (default) — natural language goes to the agent; slash commands (`/help`, `/datasource`, `/model`, `/exit`, …) work in every mode
+- **SQL mode `sql>`** — the prompt turns into a red `sql>` with red separators and syntax highlighting; whatever you type runs through the same permission checks as an agent `execute_sql` call. Statements run, require confirmation, or are refused according to the effective permission settings (including profile overrides) and read-only restrictions. Use `\` + Enter to continue a statement on a new line.
+- **Bash mode `bash>`** — the prompt turns into a yellow `bash>`; whatever you type runs as a shell command through the same permission-gated bash tool the agent uses. Commands matching `deny` rules are blocked, and unmatched commands prompt for confirmation (allow once / session / project) exactly like agent-initiated bash calls.
+
+Each manual SQL/bash execution renders live: the command line shows immediately with a `· running Ns` indicator (like a tool call) while it runs, then resolves into a bordered execution block (command + result) framed like a user message but in the mode colour. The result is then sent to the model as a turn, so the agent immediately reasons about what you ran. The block is stored with the session, so `/resume` re-renders it in the same form.
+
+```text title="Examples"
+> /tables
+> Detailed analysis of gold–Bitcoin correlation.
+                          # Tab on the empty line switches to SQL mode
+sql> desc gold_vs_bitcoin
+                          # Tab again switches to bash mode
+bash> git status
+```
+
+For natural-language turns, Manager streams thinking deltas, tool calls, SQL, and the final markdown report live, with a pinned status row at the bottom showing the currently running tool:
+
+```text
+● Let me check the schema of gold_vs_bitcoin and run a correlation analysis.
+● describe_table({"table_name": "gold_vs_bitcoin"})  ✓ 3 columns (0.5s)
+● read_query({"sql": "SELECT CORR(gold, bitcoin) ..."}) ✓ 1 row (0.5s)
+○ Running read_query …
+```
+
+!!! tip "Trace details"
+    Press **Ctrl+O** at any time to open the inline trace for the previous turn (full tool inputs, SQL, raw outputs). Press it again or `q` to close.
+
+## Next Steps
+
+- **[Build a Context-Rich Agent](./contextual_data_engineering.md)** — build a knowledge base and measure how context improves answers
+- **[End-to-End Data Engineering](./data_engineering_quickstart.md)** — build layered tables, ETL, an Airflow DAG, and a Superset dashboard
+- **[Turn a Dashboard into a Copilot](./dashboard_copilot.md)** — turn an existing Superset dashboard into analysis subagents
+- **[Configuration Guide](../configuration/introduction.md)** — connect your own databases and customize settings
+- **[CLI Reference](../cli/introduction.md)** — all commands and options
+- **[Semantic Engine](../semantic/dosi_engine.md)** — Dosi configuration and Agent integration

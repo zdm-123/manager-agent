@@ -1,0 +1,212 @@
+# Adapter Contract Tests
+
+End-to-end contract tests that exercise `DBFuncTool` / `BIFuncTool` (main repo)
+against real database / BI services started from each adapter's own docker-compose.
+
+Each adapter's contract tests are **opt-in** via an env var, because they
+require a docker container to be running. Tests skip cleanly when the opt-in
+flag is unset.
+
+## Why separate `integration/adapters/`?
+
+`tests/integration/tools/` already covers `DBFuncTool` against SQLite/DuckDB.
+This directory specifically exercises the *adapter packages* (`manager-postgresql`,
+`manager-mysql`, etc.) — one suite per adapter, each using the adapter repo's
+own `docker-compose.yml` as the canonical fixture.
+
+## Running
+
+### PostgreSQL
+
+```bash
+# 1. Install the adapter (not a hard dep of Manager-agent)
+uv pip install manager-postgresql
+
+# 2. Start the docker container (in the adapter repo)
+cd /path/to/manager-db-adapters/manager-postgresql
+docker compose up -d
+# Wait ~30s for the healthcheck to pass
+
+# 3. Run the contract tests (from Manager-agent repo)
+cd /path/to/Manager-agent
+ADAPTERS_PG=1 uv run pytest tests/integration/adapters/test_postgresql.py -v
+
+# 4. Tear down
+cd /path/to/manager-db-adapters/manager-postgresql
+docker compose down -v
+```
+
+### ClickHouse HTTPS
+
+HTTPS requires `manager-clickhouse>=0.1.4`, `manager-sqlalchemy>=0.1.10`, and `datus-db-core>=0.1.8`. These versions are not yet published. Until release, use an adapter checkout containing [manager-db-adapters#160](https://github.com/Datus-ai/datus-db-adapters/pull/160). After setting up the Agent development environment, install its three packages from the Agent checkout:
+
+```bash
+uv pip install \
+  -e /path/to/manager-db-adapters/datus-db-core \
+  -e /path/to/manager-db-adapters/manager-sqlalchemy \
+  -e /path/to/manager-db-adapters/manager-clickhouse
+```
+
+Once these versions are published, `uv pip install "manager-clickhouse>=0.1.4"` can replace the source installation. Configure the HTTPS endpoint and CA used by the adapter TLS tests, then run:
+
+```bash
+ADAPTERS_CH=1 CLICKHOUSE_HOST=localhost CLICKHOUSE_PORT=18443 \
+  CLICKHOUSE_PROTOCOL=https CLICKHOUSE_VERIFY=true CLICKHOUSE_CA_CERT=/absolute/path/ca.crt \
+  uv run --no-sync pytest tests/integration/adapters/test_clickhouse.py -v
+```
+
+Keep `--no-sync` after installing the adapter: the Agent lockfile currently pins an older core, and syncing would replace the newer packages required for HTTPS. This matches the nightly workflow's `UV_NO_SYNC=1` setup.
+
+The suite verifies `DBFuncTool` and YAML → `DbConfig` → `DBManager` → adapter registration, including metadata and read-only checks. Supply `CLICKHOUSE_USER/PASSWORD/DATABASE` for the selected test service. Once opted in, connection failures fail the suite.
+
+### Trino HTTPS
+
+Private CA profiles require the upcoming `manager-trino>=0.1.4`,
+`manager-sqlalchemy>=0.1.10`, and `datus-db-core>=0.1.8`. These versions are not yet
+published. After setting up the Agent environment, install the three source packages:
+
+```bash
+uv pip install \
+  -e /path/to/manager-db-adapters/datus-db-core \
+  -e /path/to/manager-db-adapters/manager-sqlalchemy \
+  -e /path/to/manager-db-adapters/manager-trino
+```
+
+Once released, `uv pip install "manager-trino>=0.1.4"` replaces the source installation.
+Point to a running HTTPS endpoint with the built-in `tpch.tiny` catalog:
+
+```bash
+ADAPTERS_TRINO=1 TRINO_HOST=localhost TRINO_PORT=18443 TRINO_USER=trino \
+  TRINO_HTTP_SCHEME=https TRINO_VERIFY=true TRINO_CA_CERT=/absolute/path/ca.crt \
+  uv run --no-sync pytest tests/integration/adapters/test_trino.py -v
+```
+
+Keep `--no-sync` after source installation: the Agent lockfile currently pins an
+older core. The suite exercises YAML → `DbConfig.extra` → `DBManager` → registry →
+`DBFuncTool`, including query, metadata and read-only checks. Once opted in, connection
+failures fail the suite. Omit `TRINO_CA_CERT` for a normally trusted endpoint.
+Nightly's default forced Docker profile clears `TRINO_VERIFY` and `TRINO_CA_CERT`
+when selecting HTTP; `NIGHTLY_FORCE_ADAPTER_ENV=0` preserves an external TLS profile.
+
+### Snowflake with AWS Secrets Manager
+
+This cloud test requires `manager-snowflake[aws]>=0.1.11` and `datus-db-core>=0.1.10`.
+Install the published packages into the Agent environment:
+
+```bash
+uv pip install 'manager-snowflake[aws]>=0.1.11'
+```
+
+Export `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_EXPECTED_USER`, `SNOWFLAKE_WAREHOUSE`,
+`SNOWFLAKE_DATABASE`, `SNOWFLAKE_PRIVATE_KEY_FILE`, optional
+`SNOWFLAKE_PRIVATE_KEY_FILE_PWD`, `SNOWFLAKE_SCHEMA` and `SNOWFLAKE_ROLE`.
+AWS uses its SDK credential chain, `MANAGER_SECRET_AWS_REGION` (default `us-east-1`),
+and optional `MANAGER_SECRET_AWS_PROFILE`, including assume-role profiles.
+`SNOWFLAKE_USER` is the login name; `SNOWFLAKE_EXPECTED_USER` is the exact user-object
+name returned by `CURRENT_USER()`, which can differ from the login name. Warehouse
+and database expectations resolve unquoted identifiers to uppercase and preserve
+explicitly double-quoted case, including escaped double quotes.
+
+```bash
+ADAPTERS_SNOWFLAKE_SECRETS=1 uv run --no-sync pytest \
+  tests/integration/adapters/test_snowflake_secrets.py -v
+```
+
+The AWS identity needs CreateSecret/GetSecretValue/DescribeSecret/DeleteSecret and
+TagResource for temporary test Secrets. This test stores the supplied key in an
+ownership-tagged temporary AWS Secret, exercises YAML → DbConfig → DBManager →
+registry → real Secret read → Snowflake login/reopen and database metadata, then
+records Secret deletion in the JUnit `secret_cleanup` property. Extra account tags
+are allowed while the ownership tag must match. AWS deletes asynchronously: the
+property distinguishes `deleted` from `deletion_requested` with the accepted deletion
+timestamp; it does not impose a deadline on physical removal. It does not modify the
+Snowflake user's keys. Full dual-key
+rotation acceptance lives in the adapter's `test_secret_rotation.py`. Once opted in,
+missing configuration and API/login failures fail the test. Keep `--no-sync` after
+installing the packages so the Agent lockfile does not replace the newer core.
+The standard Main/Product E2E/Provider Health nightly collections explicitly ignore
+this module until a dedicated credentialed cloud suite is configured; run it directly
+with the opt-in command above. Explicit strict runs still reject missing opt-in or dependencies.
+
+### Apache Doris
+
+```bash
+# Install the adapter and start its canonical FE/BE compose stack.
+uv pip install manager-doris
+cd /path/to/manager-db-adapters/manager-doris
+docker compose up -d
+
+# Run the Agent-facing DBFuncTool contract.
+cd /path/to/Manager-agent
+ADAPTERS_DORIS=1 uv run pytest tests/integration/adapters/test_doris.py -v
+
+# Tear down.
+cd /path/to/manager-db-adapters/manager-doris
+docker compose down -v
+```
+
+## Env vars
+
+| Adapter | Opt-in flag | Connection env | Default (matches adapter's docker-compose.yml) |
+|---|---|---|---|
+| postgresql | `ADAPTERS_PG=1` | `POSTGRESQL_HOST/PORT/USER/PASSWORD/DATABASE` | `localhost:5432 test_user/test_password/test` |
+| mysql | `ADAPTERS_MYSQL=1` | `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | `localhost:3306 test_user/test_password/test` |
+| clickhouse | `ADAPTERS_CH=1` | `CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE`, optional `CLICKHOUSE_PROTOCOL/VERIFY/CA_CERT` | `localhost:8123 default_user/default_test/default_test` |
+| starrocks | `ADAPTERS_SR=1` | `STARROCKS_HOST/PORT/USER/PASSWORD/CATALOG/DATABASE` | `127.0.0.1:9030 root//default_catalog/test` |
+| doris | `ADAPTERS_DORIS=1` | `DORIS_HOST/PORT/USER/PASSWORD/CATALOG/DATABASE` | `127.0.0.1:9030 root//internal/test` |
+| tidb | `ADAPTERS_TIDB=1` | `TIDB_HOST/PORT/USER/PASSWORD/DATABASE` | `127.0.0.1:4000 root//test` |
+| trino | `ADAPTERS_TRINO=1` | `TRINO_HOST/PORT/USER/PASSWORD`, optional `TRINO_HTTP_SCHEME/VERIFY/CA_CERT` | `localhost:8080 trino` (uses built-in `tpch.tiny`, no seeding) |
+| greenplum | `ADAPTERS_GP=1` | `GREENPLUM_HOST/PORT/USER/PASSWORD/DATABASE/SCHEMA` | `localhost:15432 gpadmin/pivotal/postgres/public` |
+| gaussdb | `ADAPTERS_GAUSSDB=1` | `GAUSSDB_HOST/PORT/USER/PASSWORD/DATABASE/SCHEMA/DRIVER/SSLMODE/SSLROOTCERT` | `127.0.0.1:25434 manager/Manager@123/postgres/public`; `gaussdb` on Linux, `pg8000` on macOS |
+| hive | `ADAPTERS_HIVE=1` | `HIVE_HOST/PORT/USERNAME/PASSWORD/DATABASE` | `localhost:10000 hive//default` |
+| spark | `ADAPTERS_SPARK=1` | `SPARK_HOST/PORT/USER/PASSWORD/DATABASE/AUTH_MECHANISM` | `localhost:10000 spark//default/NONE` |
+
+### Port conflicts
+
+Several adapters use default ports that are commonly occupied:
+- postgresql (5432) — conflicts with any local Postgres / superset-db
+- trino (8080) — conflicts with Airflow / many web dev servers
+- starrocks (9030) — conflicts with existing StarRocks instances
+- doris (9030) — conflicts with StarRocks and existing Doris instances
+- hive / spark (10000) — both default to the HiveServer2/Spark Thrift port; run one suite at a time or remap one service
+
+For the Trino adapter, the compose file already supports a `TRINO_HOST_PORT`
+override (see its `docker-compose.yml`). For the others, either stop the
+conflicting container or use a one-off `docker run` on an alternate port and
+override the `*_PORT` env var.
+
+## What gets tested
+
+For each adapter, contract tests cover the public surface of `DBFuncTool`
+that the agent actually calls:
+
+- `list_tables` — returns seeded tables
+- `describe_table` — returns column metadata
+- `read_query` — executes a SELECT and returns compressed rows
+- `read_query` read-only guard — rejects DML / multi-statement injection
+
+## Adding a new adapter
+
+1. Copy `test_postgresql.py` as `test_<name>.py`.
+2. Replace `manager_postgresql` imports with the new adapter's connector/config.
+3. Adjust the seeded DDL to the target dialect (quote style, type names).
+4. Pick a new opt-in flag (`ADAPTERS_<NAME>=1`) and document env vars here.
+5. Confirm the adapter's `docker-compose.yml` ports don't collide with others
+   you run simultaneously.
+
+---
+
+## Dosi runtime coverage
+
+Dosi is an Agent dependency rather than an adapter package. Its deterministic
+Agent integration tests live in `tests/integration/tools/test_dosi_attribution.py`
+and `tests/integration/agent/test_semantic_modeling_agentic.py`. The latter covers
+model authoring, validation, Knowledge Base sync, SQL compilation, and live
+SQLite query execution without an LLM or external service.
+
+```bash
+uv sync --locked --group ci
+uv run --locked pytest -q \
+  tests/integration/tools/test_dosi_attribution.py \
+  tests/integration/agent/test_semantic_modeling_agentic.py::test_dosi_authoring_validates_reconciles_and_queries_without_llm
+```

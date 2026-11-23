@@ -1,0 +1,267 @@
+name: "Coverage Check"
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      reuse_validation:
+        type: boolean
+        default: false
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reuse verified validation
+        id: reuse
+        if: inputs.reuse_validation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { reuseValidation } = require('./ci/reuse-pr-validation.js');
+            const result = await reuseValidation({ github, context, core, checkName: 'run-coverage / coverage' });
+            core.setOutput('reused', result.state === 'success');
+
+      - name: Pin comparison base
+        if: ${{ steps.reuse.outputs.reused != 'true' }}
+        id: comparison
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref || github.ref_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$PR_NUMBER" ] && [ -z "$BASE_SHA" ]; then
+            echo "PR validation requires a base commit SHA" >&2
+            exit 1
+          fi
+          if [ -n "$BASE_SHA" ]; then
+            if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Invalid base commit SHA" >&2
+              exit 1
+            fi
+            git fetch origin "$BASE_SHA"
+            git cat-file -e "${BASE_SHA}^{commit}"
+            echo "ref=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            BASE_REF="${BASE_REF#refs/heads/}"
+            git fetch origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+            echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: ${{ steps.reuse.outputs.reused != 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        if: ${{ steps.reuse.outputs.reused != 'true' }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+
+      - name: Select PR profile
+        if: ${{ steps.reuse.outputs.reused != 'true' }}
+        id: profile
+        env:
+          COMPARE_REF: ${{ steps.comparison.outputs.ref }}
+        run: |
+          uv run --no-project --with pyyaml python ci/select_gate_profile.py \
+            --base-ref "$COMPARE_REF" --github-output "$GITHUB_OUTPUT"
+
+      - name: Documentation-only summary
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests != 'true') }}
+        run: echo "Documentation-only change; documentation builds run in Deploy Docs." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate generated tool contracts
+        if: ${{ steps.reuse.outputs.reused != 'true' }}
+        run: python3 manager/tools/registry/catalog_builder.py --check
+
+      - name: Install dependencies
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: |
+          uv sync --locked --group ci
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Check release metadata
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: python3 ci/check_release_readiness.py
+
+      - name: Set up Node.js
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Check CI comment boundaries
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: node --test ci/post-coverage-comment.test.js ci/merge-queue-ref.test.js ci/reuse-pr-validation.test.js
+
+      - name: Validate harness coverage map
+        if: ${{ steps.reuse.outputs.reused != 'true' }}
+        run: |
+          set +e
+          uv run --no-project --with pyyaml python ci/harness/validate_coverage_map.py \
+            --strict \
+            --report-json ci/harness/coverage-map-report.json \
+            --report-md ci/harness/coverage-map-report.md
+          validation_exit=$?
+          set -e
+          if [ -f ci/harness/coverage-map-report.md ]; then
+            cat ci/harness/coverage-map-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$validation_exit"
+
+      - name: Setup config file
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: |
+          cp conf/agent.yml.example conf/agent.yml
+
+      - name: Restore tracked test config
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: git restore --source=HEAD --worktree --staged tests/conf/agent.yml
+
+      - name: Isolate test data directory
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: |
+          MANAGER_TEST_HOME="${GITHUB_WORKSPACE}/.manager_test_data"
+          echo "MANAGER_TEST_HOME=$MANAGER_TEST_HOME" >> "$GITHUB_ENV"
+          sed -i "s|home: .manager_test_data|home: $MANAGER_TEST_HOME|g" tests/conf/agent.yml
+          sed -i "s|project_root: .manager_test_data/workspace|project_root: $MANAGER_TEST_HOME/workspace|g" tests/conf/agent.yml
+
+      - name: Prepare small BIRD test fixtures
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        run: |
+          MANAGER_TEST_BIRD_ROOT="$RUNNER_TEMP/manager-ci-bird/dev_databases"
+          python3 ci/prepare_ci_bird.py "$MANAGER_TEST_BIRD_ROOT"
+          echo "MANAGER_TEST_BIRD_ROOT=$MANAGER_TEST_BIRD_ROOT" >> "$GITHUB_ENV"
+
+      - name: Pre-install the DuckDB excel extension
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.needs_excel == 'true') }}
+        run: |
+          # `read_xlsx` lives in an autoloadable extension DuckDB fetches over
+          # HTTPS on first use. Fetching it from inside a test would make the
+          # spreadsheet suite network-dependent, which CI tests must not be — so
+          # it is installed once here, and the tests then LOAD it locally. Same
+          # posture as the runtime image, which bakes it for egress-less pods.
+          EXT_DIR="${GITHUB_WORKSPACE}/.duckdb/extensions"
+          echo "MANAGER_DUCKDB_EXTENSION_DIRECTORY=$EXT_DIR" >> "$GITHUB_ENV"
+          uv run python - <<'PY'
+          import os
+          import duckdb
+
+          ext_dir = os.path.join(os.environ["GITHUB_WORKSPACE"], ".duckdb", "extensions")
+          con = duckdb.connect(":memory:")
+          con.execute(f"SET extension_directory='{ext_dir}'")
+          con.execute("INSTALL excel")
+          con.close()
+
+          # Same check the tests will make: load it with autoinstall off, so a
+          # failure here is a build failure rather than a mysterious test skip.
+          con = duckdb.connect(":memory:")
+          con.execute(f"SET extension_directory='{ext_dir}'")
+          con.execute("SET autoinstall_known_extensions=false")
+          con.execute("LOAD excel")
+          print(f"duckdb {duckdb.__version__}: excel extension ready in {ext_dir}")
+          PY
+
+      - name: Run tests and extract coverage
+        if: ${{ steps.reuse.outputs.reused != 'true' && (steps.profile.outputs.run_tests == 'true') }}
+        id: metrics
+        env:
+          MANAGER_CI_PYTEST_BASETEMP: ${{ runner.temp }}/manager-agent-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+          COMPARE_REF: ${{ steps.comparison.outputs.ref }}
+        run: |
+          python3 ci/run-pr-tests.py "$COMPARE_REF"
+
+      - name: Plan affected real-model product validation
+        if: ${{ steps.reuse.outputs.reused != 'true' && (always() && steps.profile.outputs.run_tests == 'true') }}
+        env:
+          COMPARE_REF: ${{ steps.comparison.outputs.ref }}
+        run: |
+          python3 ci/plan-product-tests.py --base-ref "$COMPARE_REF"
+
+      - name: Cleanup pytest temp
+        if: ${{ steps.reuse.outputs.reused != 'true' && (always()) }}
+        env:
+          MANAGER_CI_PYTEST_BASETEMP: ${{ runner.temp }}/manager-agent-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+          RUNNER_TEMP_ROOT: ${{ runner.temp }}
+        run: |
+          if [ -z "$MANAGER_CI_PYTEST_BASETEMP" ]; then
+            exit 0
+          fi
+          target="$(realpath -m "$MANAGER_CI_PYTEST_BASETEMP")"
+          runner_temp="$(realpath -m "$RUNNER_TEMP_ROOT")"
+          home_dir="$(realpath -m "$HOME")"
+          workspace="$(realpath -m "$GITHUB_WORKSPACE")"
+          case "$target" in
+            "$runner_temp"/*) ;;
+            *) echo "Refusing to remove unsafe pytest temp: $target"; exit 0 ;;
+          esac
+          if [ "$target" = "/" ] || [ "$target" = "$runner_temp" ] || [ "$target" = "$home_dir" ] || [ "$target" = "$workspace" ]; then
+            echo "Refusing to remove unsafe pytest temp: $target"
+            exit 0
+          fi
+          rm -rf "$target"
+
+      - name: Prepare coverage comment data
+        if: ${{ steps.reuse.outputs.reused != 'true' && (always() && github.event_name == 'pull_request' && steps.metrics.outputs.test_total != '') }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          METRIC_OVERALL: ${{ steps.metrics.outputs.overall }}
+          METRIC_DIFF: ${{ steps.metrics.outputs.diff }}
+          METRIC_TEST_OUTCOME: ${{ steps.metrics.outputs.test_outcome }}
+          METRIC_TEST_TOTAL: ${{ steps.metrics.outputs.test_total }}
+          METRIC_TEST_PASSED: ${{ steps.metrics.outputs.test_passed }}
+          METRIC_TEST_FAILED: ${{ steps.metrics.outputs.test_failed }}
+          METRIC_TEST_SKIPPED: ${{ steps.metrics.outputs.test_skipped }}
+        run: python3 ci/write_coverage_comment_data.py
+
+      - name: Upload coverage comment data
+        if: ${{ steps.reuse.outputs.reused != 'true' && (always() && github.event_name == 'pull_request' && steps.metrics.outputs.test_total != '') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-comment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci/coverage-comment.json
+            ci/diff-cover-report.md
+            ci/test-report.md
+            ci/product-test-plan.json
+            ci/unit-test-plan.json
+            ci/gate-coverage.json
+            ci/test-results-*.xml
+            ci/test-results-*.execution.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Check coverage thresholds
+        if: ${{ steps.reuse.outputs.reused != 'true' && (always() && steps.profile.outputs.run_tests == 'true' && steps.metrics.outcome != 'cancelled') }}
+        run: |
+          python3 -c "
+          import sys
+          diff = float('${{ steps.metrics.outputs.diff }}')
+          test_outcome = '${{ steps.metrics.outputs.test_outcome }}'
+          failed = False
+          if diff < 80:
+              print(f'::error::Diff coverage {diff}% is below the 80% threshold')
+              failed = True
+          if test_outcome != 'success':
+              print('::error::Core journeys or affected tests did not pass')
+              failed = True
+          sys.exit(1 if failed else 0)
+          "

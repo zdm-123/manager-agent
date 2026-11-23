@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""Run core journeys and affected tests with coverage and diff reporting.
+
+Usage:
+    python3 ci/run-pr-tests.py [base_ref]
+
+Outputs (written to GITHUB_OUTPUT if available, otherwise stdout):
+    overall       - Overall line coverage percentage
+    diff          - Diff coverage percentage for the PR's changed lines
+    test_total    - Total test count
+    test_passed   - Passed test count
+    test_failed   - Failed test count (failures + errors)
+    test_skipped  - Skipped test count
+    test_outcome  - "success" or "failure"
+
+Generated files (all written to ci/ directory):
+    ci/coverage.xml             - Cobertura coverage report
+    ci/test-results.xml         - Combined JUnit test results
+    ci/test-results-pr.xml      - Core journeys and affected tests in one pytest session
+    ci/diff-cover.json          - Diff coverage data
+    ci/diff-cover-report.md     - Diff coverage markdown report
+    ci/test-report.md           - Test failure markdown report
+    ci/pytest-coverage.txt      - Full pytest output
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import xml.etree.ElementTree as XMLTree
+from pathlib import Path
+from typing import Any, TextIO
+
+import defusedxml.ElementTree as ET
+
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT_DIR = os.path.dirname(OUT_DIR)
+DEFAULT_JUNIT_XML = os.path.join(OUT_DIR, "test-results.xml")
+DEFAULT_COVERAGE_XML = os.path.join(OUT_DIR, "coverage.xml")
+DEFAULT_COVERAGE_HTML = os.path.join(OUT_DIR, "htmlcov")
+DEFAULT_COVERAGE_DB = os.path.join(OUT_DIR, ".coverage")
+DEFAULT_PYTEST_LOG = os.path.join(OUT_DIR, "pytest-coverage.txt")
+# Direct script execution starts with ci/ on sys.path.
+sys.path.insert(0, REPO_ROOT_DIR)
+from ci.harness.pr_test_plan import PR_MARK_EXPR, pr_test_plan  # noqa: E402
+from ci.harness.test_plan import (  # noqa: E402
+    changed_files as changed_paths,
+)
+from ci.harness.test_plan import (  # noqa: E402
+    verify_gate,
+)
+
+PYTEST_BASETEMP_ENV = "MANAGER_CI_PYTEST_BASETEMP"
+
+
+def log(msg: str) -> None:
+    print(f"[ci] {msg}", flush=True)
+
+
+TEST_CMD_TIMEOUT = int(os.environ.get("TEST_CMD_TIMEOUT", "3600"))
+
+
+def _resolve_parallel_workers() -> str:
+    """Use half of the available CPUs unless the runner provides an override.
+
+    Shared by every parallel suite; the env var keeps its historical name so
+    existing runner overrides stay effective.
+    """
+    configured = os.environ.get("IMPACTED_UNIT_PARALLEL_WORKERS")
+    if configured:
+        return configured
+    return str(max(1, (os.cpu_count() or 1) // 2))
+
+
+PARALLEL_WORKERS = _resolve_parallel_workers()
+GIT_CMD_TIMEOUT = int(os.environ.get("GIT_CMD_TIMEOUT", "60"))
+DIFF_COVER_TIMEOUT = int(os.environ.get("DIFF_COVER_TIMEOUT", "300"))
+_COMPARE_BRANCH_CACHE: dict[str, str | None] = {}
+READER_JOIN_TIMEOUT_SECONDS = 5
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    return slug or "default"
+
+
+def _default_pytest_basetemp() -> str:
+    configured = os.environ.get(PYTEST_BASETEMP_ENV)
+    if configured:
+        return configured
+
+    temp_root = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
+    run_id = _slugify(os.environ.get("GITHUB_RUN_ID", "local"))
+    run_attempt = _slugify(os.environ.get("GITHUB_RUN_ATTEMPT", "0"))
+    return os.path.join(temp_root, f"manager-agent-pytest-{run_id}-{run_attempt}-{os.getpid()}")
+
+
+DEFAULT_PYTEST_BASETEMP = _default_pytest_basetemp()
+
+
+def _run_cmd(
+    cmd: list[str],
+    timeout: int,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a command with timeout. Returns CompletedProcess or None on timeout."""
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        log(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+        return None
+
+
+def _stream_process_output(proc: subprocess.Popen[str], log_file: TextIO) -> None:
+    """Stream process output to stdout and the log file until EOF."""
+    if not proc.stdout:
+        return
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        log_file.write(line)
+
+
+def _remove_output_path(path: str) -> None:
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def _is_under_dir(path: str, parent: str) -> bool:
+    if not parent:
+        return False
+
+    path_abs = os.path.abspath(path)
+    parent_abs = os.path.abspath(parent)
+    if path_abs == parent_abs:
+        return False
+
+    try:
+        return os.path.commonpath([path_abs, parent_abs]) == parent_abs
+    except ValueError:
+        return False
+
+
+def _is_safe_pytest_basetemp(path: str) -> bool:
+    if not path:
+        return False
+
+    path_abs = os.path.abspath(path)
+    repo_root = os.path.abspath(os.path.join(OUT_DIR, os.pardir))
+    user_home = os.path.abspath(os.path.expanduser("~"))
+    if path_abs in {os.path.abspath(os.sep), repo_root, OUT_DIR, user_home}:
+        return False
+
+    allowed_roots = [
+        os.environ.get("RUNNER_TEMP", ""),
+        tempfile.gettempdir(),
+        "/tmp",
+    ]
+    return any(_is_under_dir(path_abs, root) for root in allowed_roots)
+
+
+def _cleanup_pytest_basetemp() -> None:
+    if not os.path.exists(DEFAULT_PYTEST_BASETEMP):
+        return
+
+    if not _is_safe_pytest_basetemp(DEFAULT_PYTEST_BASETEMP):
+        log(f"Refusing to remove unsafe pytest basetemp: {DEFAULT_PYTEST_BASETEMP}")
+        return
+
+    shutil.rmtree(DEFAULT_PYTEST_BASETEMP, ignore_errors=True)
+    log(f"Cleaned pytest basetemp: {DEFAULT_PYTEST_BASETEMP}")
+
+
+def _suite_pytest_basetemp(suite_name: str) -> str:
+    return os.path.join(DEFAULT_PYTEST_BASETEMP, _slugify(suite_name))
+
+
+def _nested_runner_pytest_basetemp(basetemp: str) -> str:
+    return os.path.join(basetemp, "_nested-runners")
+
+
+def _prepare_suite_pytest_basetemp(basetemp: str) -> None:
+    os.makedirs(basetemp, exist_ok=True)
+
+
+def _reset_report_outputs() -> None:
+    for path in [
+        DEFAULT_COVERAGE_XML,
+        DEFAULT_COVERAGE_HTML,
+        DEFAULT_COVERAGE_DB,
+        DEFAULT_JUNIT_XML,
+        os.path.join(OUT_DIR, "test-results-pr.xml"),
+        os.path.join(OUT_DIR, "test-results-pr.xml.execution.json"),
+        os.path.join(OUT_DIR, "gate-coverage.json"),
+        os.path.join(OUT_DIR, "test-results-acceptance.xml"),
+        os.path.join(OUT_DIR, "test-results-impacted-unit.xml"),
+        os.path.join(OUT_DIR, "diff-cover.json"),
+        os.path.join(OUT_DIR, "diff-cover-report.md"),
+        os.path.join(OUT_DIR, "test-report.md"),
+        os.path.join(OUT_DIR, "unit-test-plan.json"),
+        DEFAULT_PYTEST_LOG,
+    ]:
+        _remove_output_path(path)
+
+
+def _build_pytest_command(
+    targets: list[str],
+    junit_xml: str,
+    *,
+    mark_expr: str | None = None,
+    append: bool = False,
+    emit_reports: bool = True,
+    basetemp: str | None = None,
+    parallel: bool = False,
+    dist: str | None = None,
+    pr_gate: bool = False,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        *targets,
+    ]
+    if basetemp:
+        cmd.append(f"--basetemp={basetemp}")
+
+    if mark_expr:
+        cmd.extend(["-m", mark_expr])
+    if pr_gate:
+        cmd.append("--pr-gate")
+
+    if parallel:
+        # Distribute the suite across pytest-xdist workers so the suites stay
+        # under TEST_CMD_TIMEOUT; pytest-cov merges per-worker data.
+        # By default, use half of the available CPUs; runners may override this.
+        # loadfile/loadscope can requeue completed work as empty units after a
+        # worker crash (pytest-xdist#1378), leaving the session waiting forever.
+        # Preserve the crash as a failure rather than attempting recovery.
+        cmd.extend(["-n", PARALLEL_WORKERS, "--max-worker-restart=0"])
+        if dist:
+            cmd.extend(["--dist", dist])
+
+    cmd.extend(["-p", "ci.pytest_gate_plugin", "--gate-report", junit_xml + ".execution.json"])
+    cmd.append("--cov=manager")
+    if append:
+        cmd.append("--cov-append")
+
+    if emit_reports:
+        cmd.append(f"--cov-report=xml:{DEFAULT_COVERAGE_XML}")
+    else:
+        cmd.append("--cov-report=")
+
+    cmd.extend(
+        [
+            f"--junitxml={junit_xml}",
+            "-o",
+            "addopts=",
+            "-o",
+            "log_cli=false",
+            "-o",
+            "verbosity_test_cases=0",
+            "-q",
+            "--tb=short",
+            "--durations=30",
+            "--disable-warnings",
+            "--log-level=CRITICAL",
+            "--log-cli-level=CRITICAL",
+            "--showlocals",
+        ]
+    )
+    return cmd
+
+
+def _run_pytest_suite(
+    targets: list[str],
+    junit_xml: str,
+    log_file: TextIO,
+    *,
+    suite_name: str,
+    mark_expr: str | None = None,
+    append: bool = False,
+    emit_reports: bool = True,
+    parallel: bool = False,
+    dist: str | None = None,
+    pr_gate: bool = False,
+) -> int:
+    """Run one pytest suite and stream logs to stdout and the CI log file."""
+    Path(junit_xml + ".execution.json").unlink(missing_ok=True)
+    basetemp = _suite_pytest_basetemp(suite_name)
+    _prepare_suite_pytest_basetemp(basetemp)
+    cmd = _build_pytest_command(
+        targets,
+        junit_xml,
+        mark_expr=mark_expr,
+        append=append,
+        emit_reports=emit_reports,
+        basetemp=basetemp,
+        parallel=parallel,
+        dist=dist,
+        pr_gate=pr_gate,
+    )
+    log(f"Running {suite_name}: {' '.join(cmd)}")
+    log(f"{suite_name} pytest basetemp: {basetemp}")
+
+    env = os.environ.copy()
+    env["MANAGER_TEST_STORAGE_BACKENDS"] = "sqlite+lance"
+    # Nested runner regressions may execute from a temporary project. Keep our
+    # reporting plugin importable there as well as in xdist workers.
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [repo_root, env.get("PYTHONPATH")]))
+    env["COVERAGE_FILE"] = DEFAULT_COVERAGE_DB
+    env[PYTEST_BASETEMP_ENV] = _nested_runner_pytest_basetemp(basetemp)
+
+    banner = f"\n=== {suite_name.upper()} ===\n"
+    sys.stdout.write(banner)
+    log_file.write(banner)
+    log_file.flush()
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "env": env,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+
+    started = time.monotonic()
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    reader = threading.Thread(target=_stream_process_output, args=(proc, log_file), daemon=True)
+    reader.start()
+
+    try:
+        exit_code = proc.wait(timeout=TEST_CMD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f"{suite_name} timed out after {TEST_CMD_TIMEOUT}s, killing process")
+        if os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.kill()
+        proc.wait()
+        timeout_msg = f"\n[ci] TIMEOUT: {suite_name} killed after {TEST_CMD_TIMEOUT}s\n"
+        sys.stdout.write(timeout_msg)
+        log_file.write(timeout_msg)
+        exit_code = 1
+    finally:
+        reader.join(timeout=READER_JOIN_TIMEOUT_SECONDS)
+        if reader.is_alive():
+            log(f"{suite_name} output reader did not exit within {READER_JOIN_TIMEOUT_SECONDS}s")
+
+    elapsed = round(time.monotonic() - started, 3)
+    execution_path = Path(junit_xml + ".execution.json")
+    if execution_path.exists():
+        report = json.loads(execution_path.read_text())
+        report["duration_seconds"] = elapsed
+        execution_path.write_text(json.dumps(report, indent=2) + "\n")
+    log(f"{suite_name} exited with code {exit_code} in {elapsed:.3f}s")
+    return exit_code
+
+
+def _git_ref_exists(ref: str) -> bool:
+    result = _run_cmd(
+        ["git", "rev-parse", "--verify", "--quiet", ref],
+        GIT_CMD_TIMEOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return bool(result and result.returncode == 0)
+
+
+def _resolve_explicit_compare_ref(base_ref: str) -> str | None:
+    """Resolve a user/GitHub-provided base ref into a git ref diff-cover accepts."""
+    ref = base_ref.strip()
+    if not ref:
+        return None
+
+    candidates: list[str] = []
+
+    def add(candidate: str) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    if ref.startswith("refs/heads/"):
+        branch = ref.removeprefix("refs/heads/")
+        add(f"origin/{branch}")
+        add(f"upstream/{branch}")
+        add(branch)
+        add(ref)
+    elif ref.startswith("refs/remotes/"):
+        add(ref.removeprefix("refs/remotes/"))
+        add(ref)
+    elif ref.startswith(("origin/", "upstream/")):
+        add(ref)
+    else:
+        add(f"origin/{ref}")
+        add(f"upstream/{ref}")
+        add(ref)
+
+    for candidate in candidates:
+        if _git_ref_exists(candidate):
+            return candidate
+
+    log(f"Explicit base_ref {base_ref!r} did not resolve; tried: {', '.join(candidates)}")
+    return None
+
+
+def find_compare_branch(base_ref: str) -> str | None:
+    """Determine the compare branch for diff-cover."""
+    if base_ref in _COMPARE_BRANCH_CACHE:
+        return _COMPARE_BRANCH_CACHE[base_ref]
+
+    if base_ref:
+        resolved_ref = _resolve_explicit_compare_ref(base_ref)
+        log(f"Using explicit base_ref: {base_ref} -> {resolved_ref or '<unresolved>'}")
+        _COMPARE_BRANCH_CACHE[base_ref] = resolved_ref
+        return resolved_ref
+
+    log("No base_ref provided, auto-detecting compare branch...")
+
+    current = _run_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        GIT_CMD_TIMEOUT,
+        capture_output=True,
+        text=True,
+    )
+    current_branch = current.stdout.strip() if current and current.returncode == 0 else ""
+    log(f"Current branch: {current_branch}")
+
+    result = _run_cmd(
+        ["git", "branch", "-r", "--format=%(refname:short)"],
+        GIT_CMD_TIMEOUT,
+        capture_output=True,
+        text=True,
+    )
+    if not result or result.returncode != 0:
+        log("Failed to list remote branches")
+        _COMPARE_BRANCH_CACHE[base_ref] = None
+        return None
+
+    branches = [
+        b.strip()
+        for b in result.stdout.splitlines()
+        if b.strip() and not b.strip().endswith("/HEAD") and b.strip() != f"origin/{current_branch}"
+    ]
+    log(f"Candidate remote branches: {len(branches)}")
+
+    head = _run_cmd(
+        ["git", "rev-parse", "HEAD"],
+        GIT_CMD_TIMEOUT,
+        capture_output=True,
+        text=True,
+    )
+    head_commit = head.stdout.strip() if head and head.returncode == 0 else ""
+    log(f"HEAD commit: {head_commit[:12]}")
+
+    best_commit = None
+    best_branch = None
+    best_timestamp = -1
+    skipped_same_as_head = 0
+    for branch in branches:
+        mb = _run_cmd(
+            ["git", "merge-base", "HEAD", branch],
+            GIT_CMD_TIMEOUT,
+            capture_output=True,
+            text=True,
+        )
+        if not mb or mb.returncode != 0:
+            continue
+        commit = mb.stdout.strip()
+        if commit == head_commit:
+            skipped_same_as_head += 1
+            continue
+        ts = _run_cmd(
+            ["git", "log", "-1", "--format=%ct", commit],
+            GIT_CMD_TIMEOUT,
+            capture_output=True,
+            text=True,
+        )
+        if ts and ts.returncode == 0:
+            timestamp = int(ts.stdout.strip())
+            if timestamp > best_timestamp:
+                best_timestamp = timestamp
+                best_commit = commit
+                best_branch = branch
+
+    log(f"Skipped {skipped_same_as_head} branches (merge-base == HEAD)")
+    if best_commit:
+        count = _run_cmd(
+            ["git", "rev-list", "--count", f"{best_commit}..HEAD"],
+            GIT_CMD_TIMEOUT,
+            capture_output=True,
+            text=True,
+        )
+        commits_ahead = count.stdout.strip() if count and count.returncode == 0 else "?"
+        log(f"Selected merge-base: {best_commit[:12]} (branch: {best_branch}, {commits_ahead} commits ahead)")
+    else:
+        log("No suitable merge-base found")
+
+    _COMPARE_BRANCH_CACHE[base_ref] = best_commit
+    return best_commit
+
+
+def list_changed_files(base_ref: str) -> list[str]:
+    """Return repository paths changed against the PR base."""
+    compare_ref = find_compare_branch(base_ref)
+    if not compare_ref:
+        raise RuntimeError("Cannot select tests without a valid compare branch")
+
+    changed = changed_paths(compare_ref)
+    log(f"Detected {len(changed)} changed files against {compare_ref}")
+    return changed
+
+
+def resolve_pr_tests(base_ref: str) -> dict:
+    plan = pr_test_plan(list_changed_files(base_ref))
+    Path(OUT_DIR, "unit-test-plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    for selection in plan["selections"]:
+        rule = selection["rule"] or "core only"
+        if selection["fallback"]:
+            rule += " (full-suite fallback)"
+        log(f"{selection['path']}: {rule} -> {', '.join(selection['targets'])}")
+    log(f"Selected {len(plan['pytest_targets'])} pytest targets; integration groups: {plan['integration_groups']}")
+    return plan
+
+
+def run_tests(base_ref: str = "") -> tuple[int, list[str]]:
+    """Collect core journeys and affected tests once, including harness-marked units."""
+    _reset_report_outputs()
+    try:
+        plan = resolve_pr_tests(base_ref)
+        junit = os.path.join(OUT_DIR, "test-results-pr.xml")
+        with open(DEFAULT_PYTEST_LOG, "w", encoding="utf-8") as log_file:
+            code = _run_pytest_suite(
+                plan["pytest_targets"],
+                junit,
+                log_file,
+                suite_name="PR tests",
+                mark_expr=PR_MARK_EXPR,
+                parallel=True,
+                dist="loadfile",
+                pr_gate=True,
+            )
+        evidence = verify_gate([Path(junit + ".execution.json")], "pr_acceptance", Path(OUT_DIR) / "gate-coverage.json")
+        merge_junit_results([junit])
+        if os.path.exists(DEFAULT_COVERAGE_DB):
+            os.remove(DEFAULT_COVERAGE_DB)
+        return int(code != 0 or evidence != 0), [junit]
+    finally:
+        _cleanup_pytest_basetemp()
+
+
+def merge_junit_results(junit_xml_paths: list[str], output_path: str | None = None) -> str:
+    """Merge one or more JUnit XML files into ci/test-results.xml."""
+    if output_path is None:
+        output_path = DEFAULT_JUNIT_XML
+
+    root = XMLTree.Element("testsuites")
+    totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    total_time = 0.0
+    suite_count = 0
+
+    for junit_xml_path in junit_xml_paths:
+        if not junit_xml_path or not os.path.exists(junit_xml_path):
+            log(f"Skipping missing JUnit XML during merge: {junit_xml_path}")
+            continue
+
+        try:
+            tree = ET.parse(junit_xml_path)
+            source_root = tree.getroot()
+        except Exception as e:
+            log(f"Failed to parse {junit_xml_path} during merge: {e}")
+            continue
+
+        suites = source_root.findall("testsuite") if source_root.tag == "testsuites" else [source_root]
+        for suite in suites:
+            root.append(copy.deepcopy(suite))
+            suite_count += 1
+            for attr in totals:
+                totals[attr] += int(suite.attrib.get(attr, 0))
+            total_time += float(suite.attrib.get("time", 0) or 0)
+
+    for attr, value in totals.items():
+        root.set(attr, str(value))
+    root.set("time", f"{total_time:.3f}")
+
+    XMLTree.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
+    log(f"Wrote merged JUnit report to {output_path} ({suite_count} suites)")
+    return output_path
+
+
+def parse_test_results(junit_xml_paths: str | list[str] | None = None) -> dict[str, Any]:
+    """Parse one or more JUnit XML files to extract test counts and failures."""
+    if junit_xml_paths is None:
+        junit_xml_paths = [DEFAULT_JUNIT_XML]
+    elif isinstance(junit_xml_paths, str):
+        junit_xml_paths = [junit_xml_paths]
+
+    total = passed = failed = errors = skipped = 0
+    failures: list[dict[str, str]] = []
+    parsed_any = False
+
+    for junit_xml_path in junit_xml_paths:
+        if not os.path.exists(junit_xml_path):
+            log(f"JUnit XML not found, skipping parse: {junit_xml_path}")
+            continue
+
+        try:
+            tree = ET.parse(junit_xml_path)
+            root = tree.getroot()
+        except Exception as e:
+            log(f"Failed to parse {junit_xml_path}: {e}")
+            continue
+
+        parsed_any = True
+        suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+
+        for suite in suites:
+            total += int(suite.attrib.get("tests", 0))
+            errors += int(suite.attrib.get("errors", 0))
+            failed += int(suite.attrib.get("failures", 0))
+            skipped += int(suite.attrib.get("skipped", 0))
+
+            for testcase in suite.findall("testcase"):
+                failure = testcase.find("failure")
+                error = testcase.find("error")
+                fault = failure if failure is not None else error
+                if fault is not None:
+                    failures.append(
+                        {
+                            "name": testcase.attrib.get("name", "unknown"),
+                            "classname": testcase.attrib.get("classname", ""),
+                            "message": fault.attrib.get("message", ""),
+                            "text": (fault.text or "").strip(),
+                        }
+                    )
+
+    if parsed_any:
+        passed = total - failed - errors - skipped
+        log(f"Test results: {passed} passed, {failed} failed, {errors} errors, {skipped} skipped (total: {total})")
+    else:
+        log("No JUnit XML results were parsed")
+
+    return {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "skipped": skipped,
+        "failures": failures,
+    }
+
+
+def write_test_report(test_results: dict[str, Any], output_path: str | None = None) -> str:
+    """Write a markdown report of test failures."""
+    if output_path is None:
+        output_path = os.path.join(OUT_DIR, "test-report.md")
+    lines = []
+    failures = test_results["failures"]
+    total = test_results["total"]
+    passed = test_results["passed"]
+    failed = test_results["failed"] + test_results["errors"]
+    skipped = test_results["skipped"]
+
+    lines.append(f"**{passed}/{total}** tests passed")
+    if skipped:
+        lines.append(f", {skipped} skipped")
+    if failed:
+        lines.append(f", **{failed} failed**")
+    lines.append("\n")
+
+    if failures:
+        lines.append("\n### Failed Tests\n\n")
+        for i, failure in enumerate(failures, 1):
+            test_id = f"{failure['classname']}::{failure['name']}" if failure["classname"] else failure["name"]
+            lines.append(f"{i}. `{test_id}`\n")
+
+        lines.append("\n### Failure Details\n\n")
+        for failure in failures:
+            test_id = f"{failure['classname']}::{failure['name']}" if failure["classname"] else failure["name"]
+            lines.append(f"<details><summary><code>{test_id}</code></summary>\n\n")
+            if failure["message"]:
+                lines.append(f"**Message:** {failure['message']}\n\n")
+            if failure["text"]:
+                lines.append(f"```\n{failure['text']}\n```\n\n")
+            lines.append("</details>\n\n")
+
+    report = "".join(lines)
+    try:
+        with open(output_path, "w", encoding="utf-8") as fh:
+            fh.write(report)
+        log(f"Wrote test report to {output_path}")
+    except Exception as e:
+        log(f"Failed to write test report: {e}")
+
+    return report
+
+
+def extract_coverage(base_ref: str) -> tuple[float, float]:
+    """Extract overall and diff coverage metrics."""
+    diff_json = os.path.join(OUT_DIR, "diff-cover.json")
+    diff_report = os.path.join(OUT_DIR, "diff-cover-report.md")
+
+    try:
+        tree = ET.parse(DEFAULT_COVERAGE_XML)
+        overall = float(tree.getroot().attrib.get("line-rate", 0)) * 100
+        log(f"Overall coverage: {overall:.2f}%")
+    except Exception as e:
+        log(f"Failed to parse {DEFAULT_COVERAGE_XML}: {e}")
+        return 0.0, 0.0
+
+    compare_branch = find_compare_branch(base_ref)
+    if compare_branch:
+        log(f"Running diff-cover --compare-branch={compare_branch}")
+        proc = _run_cmd(
+            [
+                "diff-cover",
+                DEFAULT_COVERAGE_XML,
+                f"--compare-branch={compare_branch}",
+                "--json-report",
+                diff_json,
+                "--markdown-report",
+                diff_report,
+                "--fail-under=0",
+                "--exclude",
+                "manager/cli/web/chatbot.py",
+                "--exclude",
+                "manager/cli/screen/subject_screen.py",
+            ],
+            DIFF_COVER_TIMEOUT,
+            capture_output=True,
+            text=True,
+        )
+        if not proc or proc.returncode != 0:
+            err = proc.stderr.strip() if proc else "timed out"
+            code = proc.returncode if proc else "timeout"
+            log(f"diff-cover failed (exit {code}): {err}")
+        else:
+            log("diff-cover completed successfully")
+    else:
+        log("Skipping diff-cover (no compare branch)")
+
+    try:
+        with open(diff_json, encoding="utf-8") as f:
+            diff_pct = json.load(f).get("total_percent_covered", 0)
+        log(f"Diff coverage: {diff_pct:.2f}%")
+    except Exception as e:
+        diff_pct = 0
+        log(f"Failed to read {diff_json}: {e}")
+
+    return overall, diff_pct
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run core journeys and affected tests with coverage and diff reporting.",
+    )
+    parser.add_argument(
+        "base_ref",
+        nargs="?",
+        default="",
+        help="Base branch reference for diff-cover comparison (e.g. 'main').",
+    )
+    args = parser.parse_args()
+
+    base_ref = args.base_ref
+    log(f"Starting (base_ref={base_ref!r})")
+
+    test_exit_code, junit_xml_paths = run_tests(base_ref=base_ref)
+    test_outcome = "success" if test_exit_code == 0 else "failure"
+
+    test_results = parse_test_results(junit_xml_paths)
+    write_test_report(test_results)
+    overall, diff_pct = extract_coverage(base_ref)
+
+    outputs = {
+        "overall": f"{overall:.2f}",
+        "diff": f"{diff_pct:.2f}",
+        "test_total": str(test_results["total"]),
+        "test_passed": str(test_results["passed"]),
+        "test_failed": str(test_results["failed"] + test_results["errors"]),
+        "test_skipped": str(test_results["skipped"]),
+        "test_outcome": test_outcome,
+    }
+
+    github_output = os.environ.get("GITHUB_OUTPUT", "")
+    if github_output:
+        with open(github_output, "a", encoding="utf-8") as f:
+            for key, val in outputs.items():
+                f.write(f"{key}={val}\n")
+        log(f"Wrote outputs to GITHUB_OUTPUT: {outputs}")
+    else:
+        log("GITHUB_OUTPUT not set, printing to stdout")
+        for key, val in outputs.items():
+            print(f"{key}={val}")
+
+    log("Done")
+    return test_exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

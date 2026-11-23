@@ -1,0 +1,327 @@
+# Manager MCP Server
+
+Expose Manager's database and context search tools via the **Model Context Protocol (MCP)**, enabling integration with
+Claude Desktop, Claude Code, and other MCP-compatible clients.
+
+**Server Modes:**
+
+- **Static Mode**: Single datasource, suitable for Claude Desktop, CLI tools, or single-tenant HTTP/SSE server
+- **Dynamic Mode**: Multi-datasource HTTP/SSE server, supports all datasources via URL path
+
+**Supported Transport Modes:**
+
+- `http`: Streamable HTTP (bidirectional, default)
+- `sse`: Server-Sent Events over HTTP (for web clients)
+- `stdio`: Standard input/output (for Claude Desktop and CLI tools)
+
+## Quick Start
+
+- Install Manager:
+
+```bash
+pip install manager-agent
+```
+
+- Start the MCP server:
+
+```bash
+# Static Mode: Single datasource
+uvx --from manager-agent manager-mcp --datasource <your datasource>
+uvx --from manager-agent manager-mcp --datasource <your datasource> --transport http --host 127.0.0.1 --port 8000
+# Dynamic Mode: Multi-datasource HTTP/SSE server
+uvx --from manager-agent manager-mcp --dynamic --transport http --host 127.0.0.1 --port 8000
+uvx --from manager-agent manager-mcp --dynamic --transport sse --host 127.0.0.1 --port 8000
+
+# Or run directly
+manager-mcp --datasource <your datasource>
+# Dynamic Mode: Multi-datasource HTTP/SSE server
+manager-mcp --dynamic --transport http --host 127.0.0.1 --port 8000
+manager-mcp --dynamic --transport sse --host 127.0.0.1 --port 8000
+```
+
+## Blocking tools and capacity
+
+Both server modes execute synchronous tools, plugin argument transformers and
+result formatting in a dedicated worker pool. Request ContextVars propagate to
+workers; asynchronous tools are awaited on the request's event loop.
+
+Configure the pool in `agent.yml` (shared across tools and datasources within
+one server):
+
+```yaml
+agent:
+  mcp_tool_execution:
+    max_workers: 8
+    max_queue_size: 16
+```
+
+These are the defaults. `max_workers` must be positive and `max_queue_size`
+nonnegative. Calls beyond the running-plus-queued limit fail immediately with
+an MCP tool error; clients can retry later. This pool is separate from asyncio's
+default executor, keeping unrelated HTTP work responsive when tools stall.
+
+Integer strings are accepted for both capacity settings. Unknown keys, boolean
+values and fractional values produce configuration errors. Non-mapping
+`mcp_tool_execution` values fall back to the defaults.
+Warm datasource contexts use a non-blocking cache fast path, so lookups do not
+occupy tool workers when the cache lock is available. Cache hits also bypass
+datasource initialization locks.
+
+Cancelling a request does **not** terminate a blocking database driver call or
+release its capacity: submitted work retains its slot until it actually finishes.
+Configure connection and socket/read timeouts in the datasource adapter as well;
+an HTTP or asyncio timeout alone cannot stop a stalled StarRocks/PyMySQL read.
+Check that the adapter passes timeouts to the driver: a setting named
+`timeout_seconds` may only cover pool checkout, not socket reads. Adapter-level
+timeout changes belong in the separately versioned database adapter package.
+Shutdown stops accepting work without waiting on the event loop for stuck reads.
+
+Dynamic contexts remain pinned while HTTP/SSE requests or queued/running tools
+use them. LRU eviction retires a context; connector cleanup runs in the background
+only after the last user finishes, including workers whose callers cancelled.
+Shutdown retires the cache without waiting for datasource initialization. Any
+context created after shutdown is cleaned up rather than cached again.
+
+Static servers also retain connectors until every submitted tool call finishes,
+even if its request was cancelled. `close()` retires the tools and schedules
+connector cleanup in the background; it does not synchronously close active connections.
+
+Embedding backends using the original asynchronous `get_or_create_context()` /
+synchronous `close_all()` manager interface remain supported. The injected
+manager keeps its identity and configuration ownership. A compatibility layer
+serializes lookups only for the same datasource/subagent key; other keys keep
+working while initialization or policy I/O stalls. Previously returned contexts
+are pinned before policy refresh, so concurrent eviction cannot close their
+connectors. Returned contexts retain a request pin, and their `close()` calls on
+eviction defer cleanup until the last user finishes. The manager must start with
+an empty cache, route lookups through this server, and publish new cache entries
+after initialization/policy I/O, without yielding between publication and return.
+Pending lookups finish before `close_all()` runs in the cleanup worker.
+Such managers use the default bounded tool capacity; their async lookup method
+must keep its own blocking initialization off the event loop.
+
+Deploying this fix to an embedding backend requires updating its Manager-agent
+dependency/submodule and rebuilding the backend image.
+
+## Client Integration
+
+### Claude Code
+
+Start the Manager MCP server, then add it to Claude Code:
+
+```bash
+# Start server (SSE mode)
+manager-mcp --dynamic --transport sse --port 8000
+
+# Add to Claude Code
+claude mcp add --transport sse manager http://127.0.0.1:8000/sse/<your datasource>
+```
+
+### Claude Desktop
+
+Claude Desktop requires [mcp-remote](https://www.npmjs.com/package/mcp-remote) to connect to a remote MCP server.
+
+Start the Manager MCP server, then configure Claude Desktop using the following script:
+
+```bash
+# npx may not be found directly by Claude Desktop, so we resolve the full paths
+NODE_BIN_DIR=$(dirname $(which node))
+NPX_PATH=$(which npx)
+
+cat > ~/Library/Application\ Support/Claude/claude_desktop_config.json << EOF
+{
+  "mcpServers": {
+    "manager-agent": {
+      "command": "$NPX_PATH",
+      "args": [
+        "mcp-remote@latest",
+        "http://127.0.0.1:8000/sse/<your datasource>",
+        "--transport",
+        "sse-only"
+      ],
+      "env": {
+        "PATH": "$NODE_BIN_DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}
+EOF
+```
+
+Or manually add the following to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "manager-agent": {
+      "command": "npx",
+      "args": [
+        "mcp-remote@latest",
+        "http://127.0.0.1:8000/sse/<your datasource>",
+        "--transport",
+        "sse-only"
+      ]
+    }
+  }
+}
+```
+
+!!! tip
+    Claude Desktop also supports stdio transport directly. See the [Other MCP Clients](#other-mcp-clients) section for stdio configuration.
+
+### Other MCP Clients
+
+For MCP clients that support stdio transport:
+
+- **Using uvx:**
+
+```json
+{
+  "mcpServers": {
+    "manager": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "manager-agent",
+        "manager-mcp",
+        "--datasource",
+        "<your datasource>",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
+```
+
+- **Using python directly:**
+
+```json
+{
+  "mcpServers": {
+    "manager": {
+      "command": "python",
+      "args": [
+        "-m",
+        "manager.mcp_server",
+        "--datasource",
+        "<your datasource>",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
+```
+
+For MCP clients that support HTTP/SSE transport:
+
+- **SSE:**
+```json
+{
+  "mcpServers": {
+    "ManagerServer": {
+      "url": "http://127.0.0.1:8000/sse/<your datasource>",
+      "transport": "sse"
+    }
+  }
+}
+```
+
+- **Streamable HTTP:**
+```json
+{
+  "mcpServers": {
+    "ManagerServer": {
+      "url": "http://127.0.0.1:8000/mcp/<your datasource>",
+      "transport": "http"
+    }
+  }
+}
+```
+
+## HTTP Server Mode
+
+**Static Mode (Single Datasource):**
+
+```bash
+# Streamable HTTP (default, bidirectional)
+manager-mcp --datasource <your datasource> --transport http --host 0.0.0.0 --port 8000
+
+# SSE mode (for web clients)
+manager-mcp --datasource <your datasource> --transport sse --port 8000
+```
+
+Connect to:
+
+- Streamable HTTP: `http://localhost:8000/mcp`
+- SSE: `http://localhost:8000/sse`
+
+**Dynamic Mode (Multi-Datasource):**
+
+Run a single server that supports all configured datasources via URL path:
+
+```bash
+# Start dynamic server with sse mode
+manager-mcp --dynamic --host 0.0.0.0 --port 8000 --transport sse
+
+# Start dynamic server with streamable HTTP mode
+manager-mcp --dynamic --host 0.0.0.0 --port 8000 --transport http
+```
+
+Connect to specific datasource:
+
+- HTTP: `http://localhost:8000/mcp/{datasource}`
+- SSE: `http://localhost:8000/sse/{datasource}`
+- With subagent: `http://localhost:8000/mcp/{datasource}?subagent={subagent_name}`
+
+Example:
+
+- Streamable HTTP, datasource `bird_sqlite`: `http://localhost:8000/mcp/bird_sqlite`
+- SSE, datasource `bird_sqlite`: `http://localhost:8000/sse/bird_sqlite`
+- Streamable HTTP, datasource `superset`, subagent `sales_dashboard`: `http://localhost:8000/mcp/superset?subagent=sales_dashboard`
+
+Info endpoints:
+
+- `http://localhost:8000/` - Server info and available datasources
+- `http://localhost:8000/health` - Health check
+
+## Available Tools
+
+The MCP server registers these tools. Availability depends on the datasource and configured capabilities; use `tools/list` for the active connection.
+
+| Category | Tools |
+| --- | --- |
+| **Database** | `check_datasource_quality`, `describe_table`, `execute_sql`, `get_migration_capabilities`, `import_database_file`, `list_databases`, `list_schemas`, `list_tables`, `load_file_as_table`, `plan_datasource`, `search_table`, `suggest_table_layout`, `validate_ddl` |
+| **Context Search** | `get_reference_sql`, `list_subject_tree`, `search_metrics`, `search_reference_sql`, `search_semantic_objects` |
+| **Semantic** | `attribution_analyze`, `get_dataset`, `get_metric`, `get_query_metrics_result`, `list_metrics`, `query_metrics`, `validate_semantic` |
+| **Reference Templates** | `execute_reference_template`, `get_reference_template`, `render_reference_template`, `search_reference_template` |
+| **Date Parsing** | `parse_temporal_expressions` |
+| **Platform Docs** | `get_document`, `list_document_nav`, `search_document` |
+| **Filesystem** | `glob`, `grep`, `read_file`, `read_image` |
+
+## Command Line Options
+
+```bash
+manager-mcp --help
+
+Mode Selection (mutually exclusive, one required):
+  --dynamic            Run in dynamic mode: support all datasources via /mcp/{datasource} URL
+  --datasource, -n      Run in static mode with specified datasource
+
+Static Mode Options:
+  --sub-agent, -s      Sub-agent name for scoped context
+  --config, -c         Path to agent configuration file
+  --transport, -t      Transport type: http (default), sse, stdio
+
+Dynamic Mode Options:
+  --transport, -t      Transport type: http (default), sse:
+                       http: via /mcp/{datasource} URL
+                       sse: via /sse/{datasource} URL
+
+Common Options:
+  --config, -c         Path to agent configuration file
+  --host               Host to bind for HTTP transports (default: 0.0.0.0)
+  --port, -p           Port to bind for HTTP transports (default: 8000)
+  --debug              Enable debug logging
+```

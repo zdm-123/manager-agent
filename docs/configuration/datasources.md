@@ -1,0 +1,129 @@
+# Datasources
+
+A datasource is a named database connection used by Manager for SQL execution, metadata discovery, and knowledge-base indexing. Configure datasources under `agent.services.datasources` in `agent.yml`.
+
+```yaml
+agent:
+  services:
+    datasources:
+      analytics:
+        type: postgresql
+        host: ${POSTGRES_HOST}
+        port: 5432
+        username: ${POSTGRES_USER}
+        password: ${POSTGRES_PASSWORD}
+        database: analytics
+        schema: public
+        default: true
+```
+
+Each key under `datasources` is the datasource name. Names may contain letters, numbers, underscores, and hyphens. Set `default: true` on at most one entry; when only one datasource exists, Manager selects it automatically.
+
+!!! note
+    The configuration path remains `agent.services.datasources`. See [Dosi Semantic Engine](../semantic/dosi_engine.md) for model discovery, and prefer [plugins](../plugin/introduction.md) for integrations such as Airflow.
+
+## Choose a datasource
+
+SQLite and DuckDB are built into Manager. Every other datasource is provided by an independently installable `manager-<type>` adapter. Manager can install a missing adapter when you add the datasource with `/datasource`; you can also install the package explicitly.
+
+| Datasource | `type` | Package | Namespace |
+|---|---|---|---|
+| [SQLite](datasources/sqlite.md) | `sqlite` | built in | database file → table |
+| [DuckDB](datasources/duckdb.md) | `duckdb` | built in | database → schema → table |
+| [MySQL](datasources/mysql.md) | `mysql` | `manager-mysql` | database → table |
+| [PostgreSQL](datasources/postgresql.md) | `postgresql` | `manager-postgresql` | database → schema → table |
+| [Amazon Aurora](datasources/aurora.md) | `mysql` / `postgresql` | `manager-mysql` / `manager-postgresql` | same as the selected engine |
+| [Greenplum](datasources/greenplum.md) | `greenplum` | `manager-greenplum` | database → schema → table |
+| [Amazon Redshift](datasources/redshift.md) | `redshift` | `manager-redshift` | database → schema → table |
+| [Amazon Athena](datasources/athena.md) | `athena` | `manager-athena` | catalog → database → table |
+| [Snowflake](datasources/snowflake.md) | `snowflake` | `manager-snowflake` | database → schema → table |
+| [Google BigQuery](datasources/bigquery.md) | `bigquery` | `manager-bigquery` | project → dataset → table |
+| [StarRocks](datasources/starrocks.md) | `starrocks` | `manager-starrocks` | catalog → database → table |
+| [Apache Doris](datasources/doris.md) | `doris` | `manager-doris` | catalog → database → table |
+| [TiDB](datasources/tidb.md) | `tidb` | `manager-tidb` | database → table |
+| [ClickHouse](datasources/clickhouse.md) | `clickhouse` | `manager-clickhouse` | database → table |
+| [Trino](datasources/trino.md) | `trino` | `manager-trino` | catalog → schema → table |
+| [Hive / Inceptor](datasources/hive.md) | `hive` | `manager-hive` | database → table |
+| [Spark SQL](datasources/spark.md) | `spark` | `manager-spark` | database → table |
+| [ClickZetta](datasources/clickzetta.md) | `clickzetta` | `manager-clickzetta` | instance/workspace → schema → table |
+| [Hologres](datasources/hologres.md) | `hologres` | `manager-hologres` | database → schema → table |
+| [MaxCompute](datasources/maxcompute.md) | `maxcompute` | `manager-maxcompute` | project → optional schema → table |
+| [Oracle](datasources/oracle.md) | `oracle` | `manager-oracle` | schema → table |
+| [SAP HANA](datasources/hana.md) | `hana` | `manager-hana` | schema → table; tenant is the connection target |
+| [GaussDB / openGauss](datasources/gaussdb.md) | `gaussdb` | `manager-gaussdb` | database → schema → table |
+| [GaussDB(DWS)](datasources/dws.md) | `dws` | `manager-dws` | database → schema → table |
+
+Athena and HANA currently require the source-install commands on their pages. Install them before adding the datasource; automatic package installation cannot fetch an unpublished adapter. Aurora reuses the MySQL or PostgreSQL type and package.
+
+## Common profile keys
+
+Each datasource page documents only its type-specific connection keys. The following profile keys are handled by Manager and apply to every datasource:
+
+| Key | Type | Required | Default | Notes |
+|---|---|---:|---|---|
+| `type` | string | yes | — | Adapter type from the table above. |
+| `default` | boolean | no | `false` | Marks this entry as the default datasource. |
+
+Adapter models reject unknown keys, so copy the field names exactly. Use environment variables for credentials:
+
+```yaml
+username: ${DB_USERNAME}
+password: ${DB_PASSWORD}
+```
+
+`${NAME:-fallback}` supplies a fallback. A missing `${NAME}` expands to a visible missing-value marker and the connection will fail rather than silently using an empty credential.
+
+## File datasource patterns
+
+SQLite and DuckDB can bind one datasource to several files with `path_pattern` instead of `uri`:
+
+```yaml
+agent:
+  services:
+    datasources:
+      benchmark:
+        type: sqlite
+        path_pattern: benchmark/databases/**/*.sqlite
+        database: california_schools  # optional initial file stem
+```
+
+The matched files become databases within one datasource. Manager skips the entry at startup when the pattern matches no files.
+
+## Add, test, and select a datasource
+
+The recommended path is the interactive datasource manager:
+
+```bash
+manager
+```
+
+Run `/datasource` in the CLI. Adding or editing an entry validates its fields, installs a missing adapter, tests connectivity, and writes the result to the active `agent.yml` selected by `--config` or the normal configuration search order. Use `/datasource <name>` to switch the current session.
+
+For a manually edited file, start Manager with the target entry. Connector construction and the initial metadata load surface configuration, network, and authentication failures:
+
+```bash
+manager --config conf/agent.yml --datasource analytics
+```
+
+Project-specific selection belongs in `.manager/config.yml`:
+
+```yaml
+default_datasource: analytics
+```
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `Unsupported value ... for field datasource` | The selected name is not a key under `agent.services.datasources`. Check spelling and the active config file. |
+| Adapter import or installation error | Install the package shown in the datasource's page into the same Python environment as `manager`. |
+| Unknown or extra field | The installed adapter validates its own schema. Remove the field or use the exact key documented on that datasource page. |
+| Connection succeeds but objects are missing | Check the adapter's namespace fields (`catalog`, `database`, `schema`, or `schema_name`) and the database user's grants. |
+| Credential appears literally as `<MISSING:...>` | Export the referenced environment variable before starting Manager. |
+
+## Related documentation
+
+- [Database adapter architecture](../adapters/db_adapters.md)
+- [Deployment-wide SQL read-only mode](agent.md#sql-read-only)
+- [Plugin system](../plugin/introduction.md)
+- [CLI reference](../cli/reference.md)

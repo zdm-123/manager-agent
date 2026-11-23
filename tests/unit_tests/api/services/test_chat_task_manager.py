@@ -1,0 +1,3659 @@
+"""Tests for manager.api.services.chat_task_manager — background task management."""
+
+import asyncio
+import re
+import threading
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from manager.api.models.cli_models import (
+    IMessageContent,
+    SSEDataType,
+    SSEEndData,
+    SSEEvent,
+    SSEMessageData,
+    SSEMessagePayload,
+    SSEPingData,
+    SSEUsageData,
+)
+from manager.api.services.chat_task_manager import (
+    ChatTask,
+    ChatTaskManager,
+    _coalesce_deltas,
+    _fill_database_context,
+    _is_thinking_delta,
+    _remember_assistant_message,
+    _should_include_final_response,
+    _should_skip_duplicate_assistant_message,
+)
+from manager.tools.permission.permission_manager import PermissionManager
+from manager.tools.permission.profiles import get_profile
+from manager.tools.proxy.tool_result_channel import ToolResultChannel
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["added", "modified", "deleted", "rollback", "error", "cancelled"])
+async def test_turn_emits_one_final_semantic_diff_without_persisting_it(tmp_path, real_agent_config, outcome):
+    """Aggregate each terminal outcome into one replayable diff without adding history content."""
+    from manager.api.models.cli_models import StreamChatInput
+    from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+    root = tmp_path / "subject" / "semantic_models" / "ds"
+    root.mkdir(parents=True)
+    model = root / "model.yml"
+    if outcome != "added":
+        model.write_text("metrics: [old, retained]\n")
+    real_agent_config._project_root = tmp_path
+    history_actions = []
+
+    class FakeNode:
+        session_id = "llm-semantic-diff"
+        permission_manager = PermissionManager(global_config=get_profile("auto"), active_profile="auto")
+        proxied_tool_names = set()
+
+        def get_node_name(self):
+            """Identify the stub as the top-level chat node."""
+            return "chat"
+
+        async def execute_stream_with_interactions(self, action_history_manager):
+            """Perform real file writes before the requested success, failure or cancellation."""
+            model.write_text("metrics: [old, retained, new]\n")
+            model.write_text("metrics: [retained, new]\n")
+            if outcome == "deleted":
+                model.unlink()
+            if outcome == "error":
+                raise RuntimeError("terminal failure")
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            if outcome == "rollback":
+                model.write_text("metrics: [old, retained]\n")
+            yield ActionHistory(
+                action_id="final",
+                role=ActionRole.ASSISTANT,
+                action_type="chat_response",
+                input={},
+                output={"response": "done"},
+                status=ActionStatus.SUCCESS,
+            )
+            history_actions.extend(action_history_manager.get_actions())
+
+        async def get_last_turn_usage(self):
+            """Return no usage for this filesystem-only fixture."""
+            return None
+
+    manager = ChatTaskManager()
+    manager._create_node = lambda *args, **kwargs: FakeNode()
+    manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)
+    task = ChatTask(session_id="semantic-turn", asyncio_task=MagicMock())
+    await manager._run_loop(
+        task,
+        real_agent_config,
+        StreamChatInput(message="update metrics", source="web", session_id="semantic-turn"),
+    )
+    notifications = [
+        event
+        for event in task.events
+        if event.event == "message" and event.data.payload.content[0].type == "semantic-model-diff"
+    ]
+    assert len(notifications) == (0 if outcome == "rollback" else 1)
+    payloads = [event.data.payload.content[0].payload for event in notifications]
+    expected_changes = (
+        []
+        if outcome == "rollback"
+        else [
+            {
+                "filePath": "subject/semantic_models/ds/model.yml",
+                "changeType": outcome if outcome in {"added", "deleted"} else "modified",
+                "oldText": None if outcome == "added" else "metrics: [old, retained]\n",
+                "newText": None if outcome == "deleted" else "metrics: [retained, new]\n",
+            }
+        ]
+    )
+    assert [change for payload in payloads for change in payload["files"]] == expected_changes
+    assert [event.data.payload.message_id for event in notifications] == [
+        f"semantic-model-diff:{task.turn_id}" for _ in expected_changes
+    ]
+    terminal_id = next((item.id for item in task.events if item.event in {"end", "error"}), len(task.events))
+    assert all(event.id < terminal_id for event in notifications)
+    replayed = [item async for item in manager.consume_events(task, start_from=0)]
+    assert [item for item in replayed if item in notifications] == notifications
+    assert not task.message_contents
+    assert not task.tool_result_contents
+    assert all(action.action_type != "semantic-model-diff" for action in history_actions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "cancelled", "error"])
+async def test_repeated_cancellation_drains_semantic_diff_before_terminal_state(
+    tmp_path, real_agent_config, monkeypatch, outcome
+):
+    """Keep SSE consumers open until the final diff survives repeated stop requests."""
+    from manager.api.models.cli_models import StreamChatInput
+    from manager.api.services.semantic_model_diff import SemanticModelSnapshot
+
+    root = tmp_path / "subject" / "semantic_models" / "ds"
+    root.mkdir(parents=True)
+    model = root / "model.yml"
+    model.write_text("metrics: [original]\n")
+    real_agent_config._project_root = tmp_path
+    failure = {"completed": None, "cancelled": asyncio.CancelledError(), "error": RuntimeError("model failed")}[outcome]
+    node = TestRunLoopSettlesTurn._node(raise_after=failure)
+    node.permission_manager = PermissionManager(global_config=get_profile("auto"), active_profile="auto")
+    node.proxied_tool_names = set()
+    stream = node.execute_stream_with_interactions
+
+    async def write_then_stream(action_history_manager):
+        """Change the real YAML before the fake model reaches its terminal outcome."""
+        model.write_text("metrics: [final]\n")
+        async for action in stream(action_history_manager):
+            yield action
+
+    node.execute_stream_with_interactions = write_then_stream
+    manager = ChatTaskManager()
+    manager._create_node = lambda *args, **kwargs: node
+    manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)
+    task = ChatTask(session_id="repeated-stop", asyncio_task=MagicMock())
+    task.on_turn_end = MagicMock()
+    manager._tasks[task.session_id] = task
+    loop = asyncio.get_running_loop()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    publication_started = asyncio.Event()
+    release_publication = asyncio.Event()
+    changes = SemanticModelSnapshot.changes
+    push_event = manager._push_event
+
+    def blocked_changes(snapshot):
+        """Hold the worker scan while the run receives several cancellations."""
+        loop.call_soon_threadsafe(scan_started.set)
+        assert release_scan.wait(timeout=3)
+        return changes(snapshot)
+
+    async def blocked_publication(current, event):
+        """Hold the actual SSE append to verify consumers cannot finish early."""
+        if isinstance(event.data, SSEMessageData) and event.data.payload.content[0].type == "semantic-model-diff":
+            publication_started.set()
+            await release_publication.wait()
+        await push_event(current, event)
+
+    async def consume():
+        """Exercise the real live SSE consumer while publication is pending."""
+        return [event async for event in manager.consume_events(task, start_from=0)]
+
+    monkeypatch.setattr(SemanticModelSnapshot, "changes", blocked_changes)
+    monkeypatch.setattr(manager, "_push_event", blocked_publication)
+    runner = asyncio.create_task(
+        manager._run_loop(
+            task,
+            real_agent_config,
+            StreamChatInput(message="update metrics", source="web", session_id=task.session_id),
+        )
+    )
+    task.asyncio_task = runner
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(scan_started.wait(), timeout=2)
+        for _ in range(2):
+            runner.cancel()
+            await asyncio.sleep(0)
+        assert not runner.done()
+        assert task.status == "running"
+        assert not task.settled
+        assert manager.get_task(task.session_id) is task
+        assert not consumer.done()
+
+        release_scan.set()
+        await asyncio.wait_for(publication_started.wait(), timeout=2)
+        for _ in range(2):
+            runner.cancel()
+            await asyncio.sleep(0)
+        assert not runner.done()
+        assert task.status == "running"
+        assert not task.settled
+        assert not consumer.done()
+
+        release_publication.set()
+        _, pending = await asyncio.wait([runner, consumer], timeout=2)
+        assert not pending
+        assert runner.result() is None
+        events = consumer.result()
+        notifications = [
+            event
+            for event in events
+            if isinstance(event.data, SSEMessageData) and event.data.payload.content[0].type == "semantic-model-diff"
+        ]
+        assert len(notifications) == 1
+        assert notifications[0].data.payload.content[0].payload["files"] == [
+            {
+                "filePath": "subject/semantic_models/ds/model.yml",
+                "changeType": "modified",
+                "oldText": "metrics: [original]\n",
+                "newText": "metrics: [final]\n",
+            }
+        ]
+        expected_status = "error" if outcome == "error" else "cancelled"
+        expected_error = "model failed" if outcome == "error" else None
+        assert task.status == expected_status
+        assert task.error == expected_error
+        task.on_turn_end.assert_called_once()
+        usage, error, status, turn_id = task.on_turn_end.call_args.args
+        assert (status, error, turn_id) == (expected_status, expected_error, task.turn_id)
+        assert usage["total_tokens"] == 120
+        assert task.settled
+        assert task.session_id not in manager._tasks
+        assert manager._completed_tasks[task.session_id] is task
+        errors = [event for event in events if event.event == "error"]
+        assert [event.data.error for event in errors] == (["model failed"] if outcome == "error" else [])
+        assert all(notifications[0].id < event.id for event in errors)
+    finally:
+        release_scan.set()
+        release_publication.set()
+        runner.cancel()
+        consumer.cancel()
+        await asyncio.gather(runner, consumer, return_exceptions=True)
+
+
+class TestFillDatabaseContext:
+    """Tests for _fill_database_context."""
+
+    def test_no_database_falls_back_to_config(self, real_agent_config):
+        original = real_agent_config.current_datasource
+        catalog, database, schema = _fill_database_context(real_agent_config, database=None)
+        assert real_agent_config.current_datasource == original
+        assert catalog is None
+        assert database == "california_schools"
+        assert schema is None
+
+    def test_empty_database_falls_back_to_config(self, real_agent_config):
+        original = real_agent_config.current_datasource
+        catalog, database, schema = _fill_database_context(real_agent_config, database="")
+        assert real_agent_config.current_datasource == original
+        assert catalog is None
+        assert database == "california_schools"
+        assert schema is None
+
+    def test_explicit_database_does_not_override_datasource(self, real_agent_config):
+        original = real_agent_config.current_datasource
+        catalog, database, schema = _fill_database_context(real_agent_config, database="explicit_db")
+        assert real_agent_config.current_datasource == original
+        assert catalog is None
+        assert database == "explicit_db"
+        assert schema is None
+
+    def test_context_falls_back_to_config_fields(self, real_agent_config):
+        real_agent_config.current_db_config().type = "postgresql"
+        real_agent_config.current_db_config().uri = ""
+        real_agent_config.current_db_config().catalog = "configured_catalog"
+        real_agent_config.current_db_config().database = "configured_database"
+        real_agent_config.current_db_config().schema = "configured_schema"
+        original = real_agent_config.current_datasource
+        catalog, database, schema = _fill_database_context(real_agent_config)
+        assert real_agent_config.current_datasource == original
+        assert catalog == "configured_catalog"
+        assert database == "configured_database"
+        assert schema == "configured_schema"
+
+
+class TestChatTaskInit:
+    """Tests for ChatTask initialization."""
+
+    def test_initial_state(self):
+        """ChatTask has correct initial state."""
+        mock_task = MagicMock(spec=asyncio.Task)
+        task = ChatTask(session_id="sess-1", asyncio_task=mock_task)
+
+        assert task.session_id == "sess-1"
+        assert task.asyncio_task is mock_task
+        assert task.node is None
+        assert task.events == []
+        assert task.status == "running"
+        assert task.error is None
+        assert task.consumer_offset == 0
+        assert isinstance(task.created_at, datetime)
+
+
+class TestChatTaskManagerInit:
+    """Tests for ChatTaskManager initialization."""
+
+    def test_starts_empty(self):
+        """Manager starts with no tasks."""
+        manager = ChatTaskManager()
+        assert manager._tasks == {}
+
+    def test_default_source_and_interactive_defaults(self):
+        """Defaults: source=None, interactive=True."""
+        manager = ChatTaskManager()
+        assert manager._default_source is None
+        assert manager._default_interactive is True
+
+    def test_default_source_and_interactive_stored(self):
+        """Constructor stores explicit defaults."""
+        manager = ChatTaskManager(default_source="web", default_interactive=False)
+        assert manager._default_source == "web"
+        assert manager._default_interactive is False
+
+
+class TestChatTaskManagerCreateNodeInteractive:
+    """Verify _create_node forwards interactive flag to ChatAgenticNode."""
+
+    def test_create_node_passes_interactive_false(self, real_agent_config, mock_llm_create):
+        """interactive=False reaches ChatAgenticNode and disables ask_user_tool."""
+        manager = ChatTaskManager(default_interactive=False)
+        node = manager._create_node(
+            real_agent_config,
+            subagent_id=None,
+            node_id="sess-1",
+            user_id=None,
+            interactive=False,
+        )
+        assert node.execution_mode == "workflow"
+        assert node.ask_user_tool is None
+
+    def test_create_node_passes_interactive_true(self, real_agent_config, mock_llm_create):
+        """interactive=True retains ask_user_tool setup."""
+        manager = ChatTaskManager()
+        node = manager._create_node(
+            real_agent_config,
+            subagent_id=None,
+            node_id="sess-2",
+            user_id=None,
+            interactive=True,
+        )
+        assert node.execution_mode == "interactive"
+
+    def test_has_active_tasks_returns_false_when_empty(self):
+        """has_active_tasks is False when no tasks exist."""
+        manager = ChatTaskManager()
+        assert manager.has_active_tasks() is False
+
+    def test_get_task_returns_none_for_missing(self):
+        """get_task returns None for non-existent session."""
+        manager = ChatTaskManager()
+        assert manager.get_task("nonexistent") is None
+
+
+class TestApplyPermissionModeOverride:
+    """Verify per-request permission profile override semantics.
+
+    These tests intentionally use lightweight stubs instead of a real
+    AgentConfig/ChatAgenticNode pair: the override path is a pure
+    delegation to ``PermissionManager.switch_profile`` and the
+    interesting branches (no-op vs. real switch vs. graceful failure)
+    are easier to assert directly.
+    """
+
+    def _make_agent_config(self, raw_permissions=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            active_profile_name="normal",
+            _raw_permissions=raw_permissions or {},
+        )
+
+    def _make_node(self, current_profile="normal", switch_side_effect=None):
+        node = MagicMock()
+        node.session_id = "sess-x"
+        if current_profile is None:
+            node.permission_manager = None
+            return node
+        pm = MagicMock()
+        pm.active_profile = current_profile
+        if switch_side_effect is not None:
+            pm.switch_profile.side_effect = switch_side_effect
+        node.permission_manager = pm
+        return node
+
+    def test_noop_when_permission_mode_is_none(self):
+        """Falsy permission_mode must leave permission_manager alone."""
+        manager = ChatTaskManager()
+        node = self._make_node()
+        manager._apply_permission_mode_override(node, self._make_agent_config(), None)
+        node.permission_manager.switch_profile.assert_not_called()
+
+    def test_noop_when_node_has_no_permission_manager(self):
+        """Nodes without a permission_manager (e.g. workflow) are tolerated."""
+        manager = ChatTaskManager()
+        node = self._make_node(current_profile=None)
+        assert node.permission_manager is None
+        manager._apply_permission_mode_override(node, self._make_agent_config(), "dangerous")
+        # Permission manager must remain untouched — the override path is
+        # silently skipped when the node never had one to begin with.
+        assert node.permission_manager is None
+
+    def test_noop_when_already_on_target_profile(self):
+        """Requested profile == active profile must skip the switch."""
+        manager = ChatTaskManager()
+        node = self._make_node(current_profile="dangerous")
+        manager._apply_permission_mode_override(node, self._make_agent_config(), "dangerous")
+        node.permission_manager.switch_profile.assert_not_called()
+
+    def test_switches_profile_without_user_overrides(self):
+        """When _raw_permissions is empty, switch_profile receives user_overrides=None."""
+        manager = ChatTaskManager()
+        node = self._make_node(current_profile="normal")
+        manager._apply_permission_mode_override(node, self._make_agent_config(), "auto")
+        node.permission_manager.switch_profile.assert_called_once_with("auto", user_overrides=None)
+
+    def test_switches_profile_with_user_overrides(self):
+        """Non-empty _raw_permissions yields a built user_overrides config."""
+        from manager.tools.permission.permission_config import PermissionConfig
+
+        manager = ChatTaskManager()
+        node = self._make_node(current_profile="normal")
+        raw = {"rules": [{"tool": "db_tools", "pattern": "*", "permission": "ask"}]}
+        manager._apply_permission_mode_override(node, self._make_agent_config(raw), "dangerous")
+
+        node.permission_manager.switch_profile.assert_called_once()
+        args, kwargs = node.permission_manager.switch_profile.call_args
+        assert args == ("dangerous",)
+        assert isinstance(kwargs["user_overrides"], PermissionConfig)
+
+    def test_raises_when_user_overrides_build_fails(self, monkeypatch):
+        """Fail closed if agent.yml permissions.rules can't be parsed.
+
+        Silently dropping malformed user rules and applying the bare
+        profile base would broaden permissions beyond the operator's
+        intent, so the override path must surface the error instead.
+        """
+        manager = ChatTaskManager()
+        node = self._make_node(current_profile="normal")
+
+        def _explode(*_args, **_kwargs):
+            raise ValueError("malformed rule")
+
+        monkeypatch.setattr(
+            "manager.tools.permission.profiles.build_user_overrides",
+            _explode,
+        )
+
+        from manager.utils.exceptions import ManagerException, ErrorCode
+
+        with pytest.raises(ManagerException, match="permission_mode='auto'") as excinfo:
+            manager._apply_permission_mode_override(
+                node,
+                self._make_agent_config({"rules": [{"bad": "shape"}]}),
+                "auto",
+            )
+        assert excinfo.value.code == ErrorCode.COMMON_CONFIG_ERROR
+        node.permission_manager.switch_profile.assert_not_called()
+
+    def test_swallows_switch_profile_failure(self):
+        """A malformed override must not abort the chat turn."""
+        from manager.utils.exceptions import ManagerException, ErrorCode
+
+        manager = ChatTaskManager()
+        node = self._make_node(
+            current_profile="normal",
+            switch_side_effect=ManagerException(code=ErrorCode.COMMON_CONFIG_ERROR),
+        )
+        # Should not raise.
+        manager._apply_permission_mode_override(node, self._make_agent_config(), "auto")
+        node.permission_manager.switch_profile.assert_called_once()
+
+
+class TestChatTaskManagerBehavior:
+    """Tests for ChatTaskManager task tracking."""
+
+    def test_has_active_tasks_true_when_running(self):
+        """has_active_tasks returns True when a task has running status."""
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="s1", asyncio_task=MagicMock())
+        task.status = "running"
+        manager._tasks["s1"] = task
+        assert manager.has_active_tasks() is True
+
+    def test_has_active_tasks_false_when_completed(self):
+        """has_active_tasks returns False when all tasks are completed."""
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="s1", asyncio_task=MagicMock())
+        task.status = "completed"
+        manager._tasks["s1"] = task
+        assert manager.has_active_tasks() is False
+
+    def test_get_task_returns_existing(self):
+        """get_task returns the task for an existing session."""
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="s2", asyncio_task=MagicMock())
+        manager._tasks["s2"] = task
+        assert manager.get_task("s2") is task
+
+    @pytest.mark.asyncio
+    async def test_stop_task_missing_returns_false(self):
+        """stop_task returns False for non-existent session."""
+        manager = ChatTaskManager()
+        assert await manager.stop_task("ghost") is False
+
+    @pytest.mark.asyncio
+    async def test_shutdown_completes_without_tasks(self):
+        """shutdown completes cleanly with no tasks."""
+        manager = ChatTaskManager()
+        await manager.shutdown()
+        assert manager._tasks == {}
+        assert manager._completed_tasks == {}
+        assert manager.has_active_tasks() is False
+
+    @pytest.mark.asyncio
+    async def test_wait_all_tasks_completes_without_tasks(self):
+        """wait_all_tasks completes cleanly with no tasks."""
+        manager = ChatTaskManager()
+        await manager.wait_all_tasks()
+        assert manager._tasks == {}
+        assert manager._completed_tasks == {}
+        assert manager.has_active_tasks() is False
+
+    @pytest.mark.asyncio
+    async def test_push_event_appends_to_buffer(self):
+        """_push_event adds event to task's event list and notifies."""
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="s3", asyncio_task=MagicMock())
+        manager._tasks["s3"] = task
+
+        from manager.api.models.cli_models import SSEEvent, SSEPingData
+
+        event = SSEEvent(id=1, event="ping", data=SSEPingData(), timestamp="2025-01-01T00:00:00Z")
+        await manager._push_event(task, event)
+        assert len(task.events) == 1
+        assert task.events[0] is event
+
+    @pytest.mark.asyncio
+    async def test_degraded_context_warning_emits_nonfatal_message(self):
+        """Context degradation should be a normal assistant message, not an error event."""
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="s-degraded", asyncio_task=MagicMock())
+        node = SimpleNamespace(
+            degraded_capabilities={
+                "context_search_tools": "Context search and @ references are disabled; DB tools remain available."
+            }
+        )
+
+        next_id = await manager._push_degraded_capability_warnings(task, node, 7)
+
+        assert next_id == 8
+        assert len(task.events) == 1
+        event = task.events[0]
+        assert event.id == 7
+        assert event.event == "message"
+        assert isinstance(event.data, SSEMessageData)
+        assert event.data.type == SSEDataType.CREATE_MESSAGE
+        assert event.data.payload.role == "assistant"
+        assert event.data.payload.content[0].type == "markdown"
+        assert "DB tools remain available" in event.data.payload.content[0].payload["content"]
+
+    @pytest.mark.asyncio
+    async def test_run_loop_emits_final_response_when_no_plain_assistant_response(self, real_agent_config):
+        """The web stream must surface chat_response when the model only produced tool cards."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+        from manager.utils.trace_context import get_trace_context
+
+        captured = {}
+
+        class FakeNode:
+            session_id = "s-final"
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                from manager.observability.model_call import ModelCall
+
+                captured["trace_context"] = get_trace_context()
+                with ModelCall(model="test", model_impl="test", protocol="test") as call:
+                    call.request({"tools": []})
+                captured["run_id"] = call.fields.get("run_id")
+                yield ActionHistory(
+                    action_id="final",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="done",
+                    input={},
+                    output={"response": "1 table: orders"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-final", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="tables", session_id="s-final"))
+
+        assert captured["trace_context"].name == "agent/chat"
+        assert captured["trace_context"].session_id == "s-final"
+        assert captured["run_id"]
+        message_events = [event for event in task.events if event.event == "message"]
+        assert len(message_events) == 1
+        content = message_events[0].data.payload.content[0]
+        assert content.type == "markdown"
+        assert content.payload["content"] == "1 table: orders"
+
+    @pytest.mark.asyncio
+    async def test_run_loop_end_event_matches_final_cache_write_usage(self, real_agent_config):
+        """The real end-event producer must forward the final turn cache-write usage."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+        from manager.schemas.token_usage import TokenUsage
+
+        class FakeNode:
+            session_id = "llm-cache-write"
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                yield ActionHistory(
+                    action_id="usage-1",
+                    role=ActionRole.ASSISTANT,
+                    action_type="token_usage",
+                    messages="Token usage update",
+                    input={},
+                    output={
+                        "cumulative": {
+                            "requests": 2,
+                            "input_tokens": 900,
+                            "output_tokens": 100,
+                            "total_tokens": 1000,
+                            "cached_tokens": 300,
+                            "cache_write_tokens": 125,
+                        },
+                        "delta": {
+                            "requests": 1,
+                            "input_tokens": 400,
+                            "output_tokens": 40,
+                            "total_tokens": 440,
+                            "cached_tokens": 100,
+                            "cache_write_tokens": 25,
+                        },
+                        "last_call_input_tokens": 400,
+                        "context_length": 200_000,
+                    },
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return TokenUsage(
+                    requests=2,
+                    input_tokens=900,
+                    output_tokens=100,
+                    total_tokens=1000,
+                    cached_tokens=300,
+                    cache_write_tokens=125,
+                    session_total_tokens=400,
+                    context_length=200_000,
+                )
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="api-cache-write", asyncio_task=MagicMock())
+
+        await manager._run_loop(
+            task,
+            real_agent_config,
+            StreamChatInput(message="measure usage", session_id="api-cache-write"),
+        )
+
+        [usage_event] = [event for event in task.events if event.event == "usage"]
+        [end_event] = [event for event in task.events if event.event == "end"]
+        assert isinstance(usage_event.data, SSEUsageData)
+        assert isinstance(end_event.data, SSEEndData)
+        assert usage_event.data.cache_write_tokens == 125
+        assert usage_event.data.delta.cache_write_tokens == 25
+        assert end_event.data.cache_write_tokens == usage_event.data.cache_write_tokens
+
+    @pytest.mark.asyncio
+    async def test_run_loop_shares_task_pending_queue_with_node(self, real_agent_config):
+        """The node must share the task-scoped pending queue so a /chat/insert
+        that arrived during node startup is drained on the first turn."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        class FakeNode:
+            session_id = "s-share"
+
+            def __init__(self):
+                self.pending_input_queue = None
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                captured["queue_during_run"] = self.pending_input_queue
+                if False:  # make this an async generator without yielding
+                    yield
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-share", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="hi", session_id="s-share"))
+
+        assert task.node.pending_input_queue is task.pending_input_queue
+        assert captured["queue_during_run"] is task.pending_input_queue
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_limits", "expected_limit"),
+        [({}, 200), ({"max_turns": 2}, 2), ({"max_turns": 100}, 100)],
+    )
+    async def test_run_loop_auto_continues_residual_mid_run_message(
+        self, real_agent_config, request_limits, expected_limit
+    ):
+        """A message queued after the final turn (never seen by the SDK filter)
+        is drained after the run, echoed as a user_insert frame, and run in a
+        fresh pass — instead of being silently dropped."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-cont"
+            max_turns = 200
+
+            def __init__(self):
+                self.pending_input_queue = None
+                self.input = None
+                self.run_count = 0
+                self.run_limits = []
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                self.run_count += 1
+                self.run_limits.append(self.max_turns)
+                if self.run_count == 1:
+                    # Simulate a mid-run insert that landed after the final
+                    # turn — the SDK's call_model_input_filter never sees it.
+                    self.pending_input_queue.push("run the second SQL")
+                yield ActionHistory(
+                    action_id=f"r{self.run_count}",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="done",
+                    input={},
+                    output={"response": f"pass {self.run_count}"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        # Avoid the real @-context/node-input machinery for the continuation turn.
+        manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-cont", asyncio_task=MagicMock())
+
+        await manager._run_loop(
+            task,
+            real_agent_config,
+            StreamChatInput(message="explore", session_id="s-cont", **request_limits),
+        )
+
+        # Two passes: the original run + one auto-continuation for the residual.
+        assert task.node.run_count == 2
+        assert task.node.run_limits == [expected_limit, expected_limit]
+        # The residual was echoed to the client as a user bubble.
+        user_events = [
+            e for e in task.events if e.event == "message" and getattr(e.data.payload, "role", None) == "user"
+        ]
+        assert len(user_events) == 1
+        assert "run the second SQL" in user_events[0].data.payload.content[0].payload["content"]
+        # Queue fully drained.
+        assert len(task.pending_input_queue) == 0
+        # The accept window is closed once draining stops, so a tail-race insert
+        # gets SESSION_NOT_RUNNING instead of stranding.
+        assert task.accepting_inserts is False
+
+    @pytest.mark.asyncio
+    async def test_run_loop_continuation_reply_not_deduped_against_prior_pass(self, real_agent_config):
+        """A continuation pass producing the SAME visible text as the first pass
+        must still be emitted. Per-run de-dup state must not span passes — else
+        'run it again' shows the user bubble but drops the reply."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-dup"
+
+            def __init__(self):
+                self.pending_input_queue = None
+                self.input = None
+                self.run_count = 0
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                self.run_count += 1
+                if self.run_count == 1:
+                    self.pending_input_queue.push("do it again")
+                yield ActionHistory(
+                    action_id=f"r{self.run_count}",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="done",
+                    input={},
+                    output={"response": "identical reply"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-dup", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="explore", session_id="s-dup"))
+
+        assert task.node.run_count == 2
+        assistant_events = [
+            e for e in task.events if e.event == "message" and getattr(e.data.payload, "role", None) == "assistant"
+        ]
+        # Both passes' replies reach the client despite identical text.
+        assert len(assistant_events) == 2
+
+    @pytest.mark.asyncio
+    async def test_run_loop_emits_parallel_tool_call_prose_once(self, real_agent_config):
+        """One turn's text reaches the client once, however many streams carry it.
+
+        An assistant turn with text plus N parallel tool calls opens N
+        ``thinking_stream_*`` messages that each stream the same prose and each
+        close with an UPDATE. De-dup used to look at CREATE only, so all N went
+        through and the thread showed the paragraph N times.
+
+        Driven through ``_run_loop`` rather than the helpers: what makes the
+        UPDATE path reachable at all is the loop's own ``is_update`` bookkeeping,
+        and the skip has to happen before ``_push_event`` for the first frame to
+        be the one remembered.
+        """
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        prose = "让我先探索数据和指标定义。"
+
+        class FakeNode:
+            session_id = "s-parallel"
+
+            def __init__(self):
+                self.pending_input_queue = None
+                self.input = None
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                # Two streams, same prose. Each streams a delta first, which is
+                # what turns its own closing `response` into an UPDATE.
+                for action_id in ("thinking_stream_a", "thinking_stream_b"):
+                    yield ActionHistory(
+                        action_id=action_id,
+                        role=ActionRole.ASSISTANT,
+                        action_type="thinking_delta",
+                        messages="",
+                        input={},
+                        output={"delta": prose},
+                        status=ActionStatus.SUCCESS,
+                    )
+                    yield ActionHistory(
+                        action_id=action_id,
+                        role=ActionRole.ASSISTANT,
+                        action_type="response",
+                        messages=prose,
+                        input={},
+                        output={"response": prose, "is_thinking": False},
+                        status=ActionStatus.SUCCESS,
+                    )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-parallel", asyncio_task=MagicMock())
+
+        await manager._run_loop(
+            task,
+            real_agent_config,
+            StreamChatInput(message="analyse", session_id="s-parallel", stream_response=True),
+        )
+
+        rendered = [
+            item
+            for event in task.events
+            if event.event == "message" and isinstance(event.data, SSEMessageData)
+            for item in event.data.payload.content
+            if item.type == "markdown" and item.payload.get("content") == prose
+        ]
+        assert len(rendered) == 1
+
+    def test_drain_pending_for_continuation_variants(self):
+        """Covers all branches of the drain helper: no queue, empty, interrupted
+        (cleared), and a normal FIFO drain."""
+        from manager.cli.execution_state import PendingInputQueue
+
+        # No queue → None.
+        assert ChatTaskManager._drain_pending_for_continuation(SimpleNamespace(pending_input_queue=None)) is None
+
+        # Empty queue → None.
+        empty = SimpleNamespace(pending_input_queue=PendingInputQueue())
+        assert ChatTaskManager._drain_pending_for_continuation(empty) is None
+
+        # Interrupted → cleared and None (residual is discarded on cancel).
+        q = PendingInputQueue()
+        q.push("x")
+        interrupted = SimpleNamespace(
+            pending_input_queue=q,
+            interrupt_controller=SimpleNamespace(is_interrupted=True),
+        )
+        assert ChatTaskManager._drain_pending_for_continuation(interrupted) is None
+        assert len(q) == 0
+
+        # Normal → FIFO list.
+        q2 = PendingInputQueue()
+        q2.push("a")
+        q2.push("b")
+        live = SimpleNamespace(
+            pending_input_queue=q2,
+            interrupt_controller=SimpleNamespace(is_interrupted=False),
+        )
+        assert ChatTaskManager._drain_pending_for_continuation(live) == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_emit_user_insert_sse_noop_when_converter_returns_none(self):
+        """If the converter drops the frame, event_id is unchanged and nothing
+        is pushed."""
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="s-none", asyncio_task=MagicMock())
+
+        with patch("manager.api.services.chat_task_manager.action_to_sse_event", return_value=None):
+            new_id = await manager._emit_user_insert_sse(task, "hi", 5)
+
+        assert new_id == 5
+        assert task.events == []
+
+    @pytest.mark.asyncio
+    async def test_run_loop_caps_continuations(self, real_agent_config):
+        """A client that keeps inserting can't run one task forever — the loop
+        stops after _MAX_INSERT_CONTINUATIONS and closes the accept window."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.api.services import chat_task_manager as ctm
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-cap"
+
+            def __init__(self):
+                self.pending_input_queue = None
+                self.input = None
+                self.run_count = 0
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                self.run_count += 1
+                # Never stops producing residue.
+                self.pending_input_queue.push(f"m{self.run_count}")
+                yield ActionHistory(
+                    action_id=f"r{self.run_count}",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="x",
+                    input={},
+                    output={"response": "y"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-cap", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="go", session_id="s-cap"))
+
+        # Initial run + the cap in continuations, then it stops.
+        assert task.node.run_count == ctm._MAX_INSERT_CONTINUATIONS + 1
+        assert task.accepting_inserts is False
+
+    @pytest.mark.asyncio
+    async def test_run_loop_reopens_window_for_tail_race_insert(self, real_agent_config):
+        """A residual that only appears after the accept window closed must
+        re-open the window and continue — not be dropped."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-reopen"
+
+            def __init__(self):
+                self.pending_input_queue = None
+                self.input = None
+                self.run_count = 0
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                self.run_count += 1
+                yield ActionHistory(
+                    action_id=f"r{self.run_count}",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="x",
+                    input={},
+                    output={"response": "y"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        manager._create_node_input = lambda **kwargs: SimpleNamespace(**kwargs)  # type: ignore[method-assign]
+        # pass 1: first drain empty → close window → second drain finds a tail
+        # message → re-open and continue. pass 2: both drains empty → stop.
+        drains = iter([None, ["tail msg"], None, None])
+        manager._drain_pending_for_continuation = lambda node: next(drains)  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-reopen", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="go", session_id="s-reopen"))
+
+        # The re-opened window ran a second pass and echoed the tail message.
+        assert task.node.run_count == 2
+        user_events = [
+            e for e in task.events if e.event == "message" and getattr(e.data.payload, "role", None) == "user"
+        ]
+        assert len(user_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_loop_web_source_proxies_filesystem_writes(self, real_agent_config):
+        """source='web' proxies the client-owned write tools (write/edit/delete_file)."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        class FakeNode:
+            session_id = "s-web-proxy"
+
+            def __init__(self):
+                self.tool_channel = ToolResultChannel()
+                self.proxied_tool_names = set()
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-web-proxy", asyncio_task=MagicMock())
+
+        with patch("manager.api.services.chat_task_manager.apply_proxy_tools") as mock_apply:
+            await manager._run_loop(
+                task,
+                real_agent_config,
+                StreamChatInput(message="hi", source="web", session_id="s-web-proxy"),
+            )
+
+        mock_apply.assert_called_once()
+        called_node, called_patterns = mock_apply.call_args.args
+        assert isinstance(called_node, FakeNode)
+        assert called_patterns == ["write_file", "edit_file", "delete_file"]
+        assert task.status == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("profile", ["auto", "dangerous"])
+    async def test_run_loop_web_source_skips_proxy_for_auto_and_dangerous(self, real_agent_config, profile):
+        """auto/dangerous web sessions run filesystem tools server-side: no
+        client proxy (which would block on a browser that may be hidden or
+        gone), and an empty proxied set so SSE frames carry proxied=False."""
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        class FakeNode:
+            session_id = f"s-web-{profile}"
+            permission_manager = PermissionManager(global_config=get_profile(profile), active_profile=profile)
+
+            def __init__(self):
+                # Simulate a pre-populated shared set (PermissionHooks may
+                # hold a reference): the skip path must clear it in place.
+                self.proxied_tool_names = {"write_file"}
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+            async def get_last_turn_usage(self):
+                return None
+
+        node = FakeNode()
+        shared_ref = node.proxied_tool_names
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: node  # type: ignore[method-assign]
+        task = ChatTask(session_id=f"s-web-{profile}", asyncio_task=MagicMock())
+
+        with patch("manager.api.services.chat_task_manager.apply_proxy_tools") as mock_apply:
+            await manager._run_loop(
+                task,
+                real_agent_config,
+                StreamChatInput(message="hi", source="web", session_id=f"s-web-{profile}"),
+            )
+
+        mock_apply.assert_not_called()
+        # In-place clear, not rebinding — hooks holding the old reference
+        # must observe the emptied set.
+        assert task.node.proxied_tool_names is shared_ref
+        assert shared_ref == set()
+        assert task.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_loop_web_source_normal_profile_still_proxies(self, real_agent_config):
+        """A node whose active profile is ``normal`` keeps the client proxy —
+        the confirm UI lives in the browser."""
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        class FakeNode:
+            session_id = "s-web-normal"
+
+            def __init__(self):
+                self.tool_channel = ToolResultChannel()
+                self.proxied_tool_names = set()
+
+            permission_manager = PermissionManager(global_config=get_profile("normal"), active_profile="normal")
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-web-normal", asyncio_task=MagicMock())
+
+        with patch("manager.api.services.chat_task_manager.apply_proxy_tools") as mock_apply:
+            await manager._run_loop(
+                task,
+                real_agent_config,
+                StreamChatInput(message="hi", source="web", session_id="s-web-normal"),
+            )
+
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args.args[1] == ["write_file", "edit_file", "delete_file"]
+        assert task.status == "completed"
+
+    def test_include_final_response_rejects_nested_subagent_response(self):
+        """Depth>0 sub-agent wrappers must not render as top-level answers."""
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        action = ActionHistory(
+            action_id="nested",
+            role=ActionRole.ASSISTANT,
+            action_type="gen_sql_response",
+            messages="nested done",
+            input={},
+            output={"response": "internal sub-agent answer"},
+            status=ActionStatus.SUCCESS,
+            depth=1,
+        )
+
+        assert _should_include_final_response(action, assistant_response_sent=False) is False
+
+    @pytest.mark.asyncio
+    async def test_run_loop_ignores_nested_response_and_emits_parent_response(self, real_agent_config):
+        """A forwarded sub-agent *_response must not hide the parent chat_response."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-nested-response"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                yield ActionHistory(
+                    action_id="nested",
+                    role=ActionRole.ASSISTANT,
+                    action_type="gen_sql_response",
+                    messages="nested done",
+                    input={},
+                    output={"response": "internal sub-agent answer"},
+                    status=ActionStatus.SUCCESS,
+                    depth=1,
+                )
+                yield ActionHistory(
+                    action_id="parent",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="parent done",
+                    input={},
+                    output={"response": "top-level parent answer"},
+                    status=ActionStatus.SUCCESS,
+                    depth=0,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-nested-response", asyncio_task=MagicMock())
+
+        await manager._run_loop(
+            task,
+            real_agent_config,
+            StreamChatInput(message="delegate", session_id="s-nested-response"),
+        )
+
+        message_events = [event for event in task.events if event.event == "message"]
+        assert len(message_events) == 1
+        content = message_events[0].data.payload.content[0]
+        assert content.payload["content"] == "top-level parent answer"
+
+    @pytest.mark.asyncio
+    async def test_run_loop_skips_final_response_after_plain_assistant_response(self, real_agent_config):
+        """chat_response is a wrapper and must not duplicate a streamed assistant response."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-dedupe"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                yield ActionHistory(
+                    action_id="plain",
+                    role=ActionRole.ASSISTANT,
+                    action_type="response",
+                    messages="answer",
+                    input={},
+                    output={"raw_output": "1 table: orders", "is_thinking": False},
+                    status=ActionStatus.SUCCESS,
+                )
+                yield ActionHistory(
+                    action_id="final",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="done",
+                    input={},
+                    output={"response": "1 table: orders"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-dedupe", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="tables", session_id="s-dedupe"))
+
+        message_events = [event for event in task.events if event.event == "message"]
+        assert len(message_events) == 1
+        content = message_events[0].data.payload.content[0]
+        assert content.payload["content"] == "1 table: orders"
+
+    @pytest.mark.asyncio
+    async def test_run_loop_skips_wrapper_after_post_tool_thinking_text(self, real_agent_config):
+        """Post-tool visible assistant text suppresses chat_response even if marked as thinking."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-post-tool-thinking"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                yield ActionHistory(
+                    action_id="complete_tool",
+                    role=ActionRole.TOOL,
+                    action_type="list_tables",
+                    messages="Tool call: list_tables",
+                    input={"function_name": "list_tables"},
+                    output={"summary": "3 tables: orders, customers, invoices"},
+                    status=ActionStatus.SUCCESS,
+                )
+                yield ActionHistory(
+                    action_id="assistant_text",
+                    role=ActionRole.ASSISTANT,
+                    action_type="message",
+                    messages="answer",
+                    input={},
+                    output={"raw_output": "3 tables: orders, customers, invoices", "is_thinking": True},
+                    status=ActionStatus.SUCCESS,
+                )
+                yield ActionHistory(
+                    action_id="final",
+                    role=ActionRole.ASSISTANT,
+                    action_type="chat_response",
+                    messages="done",
+                    input={},
+                    output={"response": "3 tables: orders, customers, invoices"},
+                    status=ActionStatus.SUCCESS,
+                )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-post-tool-thinking", asyncio_task=MagicMock())
+
+        await manager._run_loop(
+            task,
+            real_agent_config,
+            StreamChatInput(message="tables", session_id="s-post-tool-thinking"),
+        )
+
+        assistant_messages = [
+            event
+            for event in task.events
+            if event.event == "message"
+            and isinstance(event.data, SSEMessageData)
+            and any(item.type in ("markdown", "thinking") for item in event.data.payload.content)
+        ]
+        assert len(assistant_messages) == 1
+        assistant_text_events = [
+            event
+            for event in assistant_messages
+            if any(
+                item.payload.get("content") == "3 tables: orders, customers, invoices"
+                for item in event.data.payload.content
+            )
+        ]
+        assert len(assistant_text_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_loop_dedupes_duplicate_plain_assistant_messages(self, real_agent_config):
+        """Identical visible assistant messages in one turn are emitted once."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        class FakeNode:
+            session_id = "s-plain-dedupe"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                for action_id, action_type in (("assistant_1", "message"), ("assistant_2", "response")):
+                    yield ActionHistory(
+                        action_id=action_id,
+                        role=ActionRole.ASSISTANT,
+                        action_type=action_type,
+                        messages="answer",
+                        input={},
+                        output={"raw_output": "3 tables: orders, customers, invoices", "is_thinking": False},
+                        status=ActionStatus.SUCCESS,
+                    )
+
+            async def get_last_turn_usage(self):
+                return None
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: FakeNode()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-plain-dedupe", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="tables", session_id="s-plain-dedupe"))
+
+        assistant_text_events = [
+            event
+            for event in task.events
+            if event.event == "message"
+            and isinstance(event.data, SSEMessageData)
+            and any(
+                item.payload.get("content") == "3 tables: orders, customers, invoices"
+                for item in event.data.payload.content
+            )
+        ]
+        assert len(assistant_text_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_task_with_no_node_cancels_asyncio_task(self):
+        """stop_task cancels asyncio task when node is not set."""
+        manager = ChatTaskManager()
+        mock_asyncio_task = MagicMock()
+        mock_asyncio_task.done.return_value = False
+        task = ChatTask(session_id="s4", asyncio_task=mock_asyncio_task)
+        task.node = None
+        manager._tasks["s4"] = task
+
+        result = await manager.stop_task("s4")
+        assert result is True
+        mock_asyncio_task.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+class TestStartChat:
+    """Tests for start_chat — background task creation."""
+
+    @pytest.mark.parametrize("type_field", ["node_class", "type"])
+    async def test_old_custom_report_streams_migration_error(self, real_agent_config, type_field):
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.agentic_nodes["legacy_report"] = {
+            "id": "legacy-report-id",
+            type_field: "gen_report",
+        }
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="Create a sales report", session_id="legacy-report-session")
+
+        task = await manager.start_chat(real_agent_config, request, sub_agent_id="legacy-report-id")
+        await task.asyncio_task
+        events = [event async for event in manager.consume_events(task)]
+
+        assert task.status == "error"
+        error = next(event.data for event in events if event.event == "error")
+        assert "legacy_report" in error.error
+        assert "Subagent 'gen_report' does not exist" in error.error
+        assert "Use 'gen_visual_report' instead" in error.error
+
+    async def test_start_chat_creates_task(self, real_agent_config, mock_llm_create):
+        """start_chat creates a ChatTask and returns it."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello", session_id="start-test")
+        task = await manager.start_chat(real_agent_config, request)
+        assert isinstance(task, ChatTask)
+        assert task.session_id == "start-test"
+        assert task.status == "running"
+        # Clean up
+        await manager.shutdown()
+
+    async def test_start_chat_fills_request_database_context(self, real_agent_config, monkeypatch):
+        """start_chat fills omitted request database context before the run loop."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.current_db_config().type = "postgresql"
+        real_agent_config.current_db_config().uri = ""
+        real_agent_config.current_db_config().catalog = "configured_catalog"
+        real_agent_config.current_db_config().database = "configured_database"
+        real_agent_config.current_db_config().schema = "configured_schema"
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["catalog"] = request.catalog
+            captured["database"] = request.database
+            captured["db_schema"] = request.db_schema
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello", session_id="api-context")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        assert captured == {
+            "catalog": "configured_catalog",
+            "database": "configured_database",
+            "db_schema": "configured_schema",
+        }
+
+    @pytest.mark.parametrize("override", [None, "next_database"])
+    async def test_resumed_turn_binds_last_selection_before_tools_are_created(
+        self, real_agent_config, monkeypatch, override
+    ):
+        import json
+
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.schemas.database_context import EXECUTION_CONTEXT_META_KEY
+
+        manager = ChatTaskManager()
+        source = real_agent_config.current_datasource
+        previous = {"datasource": source, "database": "selected", "schema": "last_schema"}
+        sessions = MagicMock()
+        sessions.load_session_meta.return_value = json.dumps(previous)
+        monkeypatch.setattr(manager, "_session_manager", lambda *args: sessions)
+        captured = {}
+
+        async def run_loop(task, config, request, **kwargs):
+            captured.update(config.runtime_db_context())
+
+        monkeypatch.setattr(manager, "_run_loop", run_loop)
+        request = StreamChatInput(message="query here", session_id="resumed", database=override)
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert captured["datasource"] == source
+        assert captured["database"] == (override or "selected")
+        assert captured.get("schema") == ("" if override else "last_schema")
+        assert real_agent_config.current_db_config().database == "california_schools"
+        sessions.load_session_meta.assert_called_once_with("resumed", EXECUTION_CONTEXT_META_KEY)
+
+    async def test_start_chat_forces_immutable_config(self, real_agent_config, monkeypatch):
+        """The per-request clone is marked read-only (filesystem + config)
+        while the shared config keeps its defaults."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello", session_id="immutable-config")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        assert captured["config"].config_mutable is False
+        assert captured["config"].filesystem_strict is True
+        # API responses render visual artifacts dynamically server-side, so
+        # the per-request clone must switch off the CLI's standalone compile.
+        assert captured["config"].compile_visual_html is False
+        # The shared config must not be mutated by the request.
+        assert real_agent_config.config_mutable is True
+        assert real_agent_config.compile_visual_html is True
+
+    async def test_policy_context_reaches_custom_subagent_on_request_clone(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["config"] = agent_config
+            captured["sub_agent_id"] = kwargs.get("sub_agent_id")
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        context = {"row_filter": {"access_mode": "scoped", "store_ids": [1, 2]}}
+        request = StreamChatInput(message="hello", session_id="policy-context")
+        task = await manager.start_chat(
+            real_agent_config,
+            request,
+            sub_agent_id="custom-sales-agent",
+            policy_context=context,
+        )
+        await task.asyncio_task
+
+        assert captured["sub_agent_id"] == "custom-sales-agent"
+        assert captured["config"] is not real_agent_config
+        assert captured["config"].policy_context == context
+        assert real_agent_config.policy_context == {}
+
+    async def test_start_chat_duplicate_session_raises(self, real_agent_config, mock_llm_create):
+        """start_chat raises ValueError for duplicate session_id."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello", session_id="dup-session")
+        await manager.start_chat(real_agent_config, request)
+
+        with pytest.raises(ValueError, match="already running"):
+            await manager.start_chat(real_agent_config, StreamChatInput(message="again", session_id="dup-session"))
+        await manager.shutdown()
+
+    async def test_start_chat_generates_session_id(self, real_agent_config, mock_llm_create):
+        """start_chat generates session_id when not provided."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello")
+        task = await manager.start_chat(real_agent_config, request)
+        assert re.fullmatch(r"chat_session_[0-9a-f]{8}", task.session_id)
+        await manager.shutdown()
+
+    async def test_start_chat_with_subagent(self, real_agent_config, mock_llm_create):
+        """start_chat with sub_agent_id creates task with correct session pattern."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello")
+        task = await manager.start_chat(real_agent_config, request, sub_agent_id="gen_sql")
+        assert "gen_sql" in task.session_id
+        await manager.shutdown()
+
+    async def test_start_chat_fills_database_context(self, real_agent_config, mock_llm_create):
+        """start_chat fills database context from request."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello", database="california_schools")
+        task = await manager.start_chat(real_agent_config, request)
+        assert isinstance(task, ChatTask)
+        assert real_agent_config.current_datasource == "california_schools"
+        await manager.shutdown()
+
+    async def test_stop_running_task_with_node(self, real_agent_config, mock_llm_create):
+        """stop_task interrupts a running task that has a node set."""
+        from unittest.mock import MagicMock
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hello", session_id="stop-test")
+        task = await manager.start_chat(real_agent_config, request)
+
+        # Set a mock node with interrupt_controller
+        mock_node = MagicMock()
+        mock_node.interrupt_controller.interrupt = MagicMock()
+        task.node = mock_node
+
+        result = await manager.stop_task("stop-test")
+        assert result is True
+        mock_node.interrupt_controller.interrupt.assert_called_once()
+        await manager.shutdown()
+
+    async def test_wait_all_tasks_with_running(self, real_agent_config, mock_llm_create):
+        """wait_all_tasks waits for running tasks without cancelling."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="wait test", session_id="wait-test")
+        task = await manager.start_chat(real_agent_config, request)
+
+        # wait_all_tasks should return (tasks may finish quickly with mock LLM)
+        await manager.wait_all_tasks()
+        assert task.asyncio_task.done() is True
+        assert manager._tasks == {}
+        assert manager.get_task("wait-test") is task
+        assert manager.has_active_tasks() is False
+        await manager.shutdown()
+
+    async def test_consume_events_yields_ping_when_idle(self, monkeypatch):
+        """consume_events yields a ping event when idle past HEARTBEAT_INTERVAL."""
+        from manager.api.models.cli_models import SSEEvent, SSEPingData
+        from manager.api.services import chat_task_manager as ctm
+
+        monkeypatch.setattr(ctm, "HEARTBEAT_INTERVAL", 0.05)
+
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="ping-test", asyncio_task=MagicMock())
+        task.status = "running"
+        manager._tasks["ping-test"] = task
+
+        gen = manager.consume_events(task, start_from=0)
+
+        # First yield should be a ping triggered by timeout
+        first = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert first.event == "ping"
+
+        # Now push a real event and ensure it is consumed next
+        real_event = SSEEvent(id=1, event="message", data=SSEPingData(), timestamp="2025-01-01T00:00:00Z")
+        await manager._push_event(task, real_event)
+
+        nxt = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        # May get another ping first if timing races; loop until we see the real event
+        while nxt.event == "ping":
+            nxt = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert nxt.event == "message"
+        assert nxt.id == 1
+
+        # Mark task done so generator exits
+        async with task.condition:
+            task.status = "completed"
+            task.condition.notify_all()
+        await gen.aclose()
+
+    async def test_consume_events_from_completed_task(self, real_agent_config, mock_llm_create):
+        """consume_events yields buffered events from completed task."""
+        from manager.api.models.cli_models import SSEEvent, SSEPingData
+
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="consume-test", asyncio_task=MagicMock())
+        task.status = "completed"
+        event = SSEEvent(id=1, event="ping", data=SSEPingData(), timestamp="2025-01-01T00:00:00Z")
+        task.events = [event]
+        manager._tasks["consume-test"] = task
+
+        events = []
+        async for e in manager.consume_events(task, start_from=0):
+            events.append(e)
+        assert len(events) == 1
+        assert events[0].id == 1
+
+
+class TestResolveAtContext:
+    """Tests for _resolve_at_context — @ reference resolution."""
+
+    def test_resolve_empty_paths_returns_empty(self, real_agent_config):
+        """_resolve_at_context with no paths returns empty lists + no hints."""
+        manager = ChatTaskManager()
+        tables, metrics, sqls, hints = manager._resolve_at_context(real_agent_config, None, None, None, None)
+        assert tables == []
+        assert metrics == []
+        assert sqls == []
+        assert hints == []
+
+    def test_resolve_with_empty_lists(self, real_agent_config):
+        """_resolve_at_context with empty lists returns empty results."""
+        manager = ChatTaskManager()
+        tables, metrics, sqls, hints = manager._resolve_at_context(real_agent_config, [], [], [], [])
+        assert tables == []
+        assert metrics == []
+        assert sqls == []
+        assert hints == []
+
+    def test_knowledge_paths_always_become_hints(self, real_agent_config):
+        """@Knowledge has no store loader, so every ref surfaces as a look-up hint."""
+        manager = ChatTaskManager()
+        _, _, _, hints = manager._resolve_at_context(real_agent_config, None, None, None, ["Domain/Glossary/gmv"])
+        assert hints == [{"kind": "knowledge", "name": "gmv", "subject_path": ["Domain", "Glossary"]}]
+
+    def test_table_completer_failure_still_yields_name_only_ref(self, real_agent_config):
+        """A completer failure must not drop a picked @Table — it degrades to a
+        name-only reference so the node still knows which table to inspect."""
+        manager = ChatTaskManager()
+
+        with patch("manager.api.services.chat_task_manager.AtReferenceCompleter", side_effect=RuntimeError("hf offline")):
+            tables = manager._resolve_table_paths(real_agent_config, ["db.schema.table"])
+
+        assert [t.table_name for t in tables] == ["table"]
+
+    def test_metric_store_failure_degrades_to_hint(self, real_agent_config):
+        """A store failure yields no typed metric but a look-up hint (not a silent drop)."""
+        manager = ChatTaskManager()
+        with patch("manager.storage.metric.store.MetricRAG", side_effect=RuntimeError("store down")):
+            metrics, hints = manager._resolve_metric_paths(real_agent_config, ["Finance/revenue"])
+        assert metrics == []
+        assert hints == [{"kind": "metric", "name": "revenue", "subject_path": ["Finance"]}]
+
+    def test_sql_store_failure_degrades_to_hint(self, real_agent_config):
+        """A store failure yields no typed reference SQL but a look-up hint."""
+        manager = ChatTaskManager()
+        with patch("manager.storage.reference_sql.store.ReferenceSqlRAG", side_effect=RuntimeError("store down")):
+            sqls, hints = manager._resolve_sql_paths(real_agent_config, ["Finance/sql"])
+        assert sqls == []
+        assert hints == [{"kind": "reference_sql", "name": "sql", "subject_path": ["Finance"]}]
+
+
+class TestCreateNode:
+    """Tests for _create_node — agentic node factory."""
+
+    def test_create_gen_sql_node(self, real_agent_config, mock_llm_create):
+        """_create_node creates GenSQLAgenticNode for gen_sql."""
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_sql", "test-session")
+        assert isinstance(node, GenSQLAgenticNode)
+
+    def test_create_node_returns_agentic_node(self, real_agent_config, mock_llm_create):
+        """_create_node returns an AgenticNode subclass for any valid subagent_id."""
+        from manager.agent.node.agentic_node import AgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "chat", "test-session")
+        assert isinstance(node, AgenticNode)
+
+    def test_create_default_node_for_none(self, real_agent_config, mock_llm_create):
+        """_create_node creates an AgenticNode when subagent_id is None."""
+        from manager.agent.node.agentic_node import AgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, None, "test-session")
+        assert isinstance(node, AgenticNode)
+
+    def test_create_gen_visual_report_node(self, real_agent_config, mock_llm_create):
+        """gen_visual_report must land on GenVisualReportAgenticNode (regression: previously fell back to GenSQL)."""
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+        from manager.agent.node.gen_visual_report_agentic_node import GenVisualReportAgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_visual_report", "test-session")
+        assert isinstance(node, GenVisualReportAgenticNode)
+        assert not isinstance(node, GenSQLAgenticNode)
+
+    def test_create_gen_table_node(self, real_agent_config, mock_llm_create):
+        """gen_table must land on GenTableAgenticNode (regression: previously fell back to GenSQL)."""
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+        from manager.agent.node.gen_table_agentic_node import GenTableAgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_table", "test-session")
+        assert isinstance(node, GenTableAgenticNode)
+        assert not isinstance(node, GenSQLAgenticNode)
+
+    def test_create_explore_node(self, real_agent_config, mock_llm_create):
+        """explore must land on ExploreAgenticNode (regression: previously fell back to GenSQL)."""
+        from manager.agent.node.explore_agentic_node import ExploreAgenticNode
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "explore", "test-session")
+        assert isinstance(node, ExploreAgenticNode)
+        assert not isinstance(node, GenSQLAgenticNode)
+
+    def test_create_feedback_node(self, real_agent_config, mock_llm_create):
+        """feedback continues to land on FeedbackAgenticNode through the shared factory."""
+        from manager.agent.node.feedback_agentic_node import FeedbackAgenticNode
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "feedback", "test-session")
+        assert isinstance(node, FeedbackAgenticNode)
+
+    def test_custom_agent_node_class_gen_visual_report(self, real_agent_config, mock_llm_create):
+        """A custom sub_agent with node_class=gen_visual_report must instantiate GenVisualReportAgenticNode."""
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+        from manager.agent.node.gen_visual_report_agentic_node import GenVisualReportAgenticNode
+
+        real_agent_config.agentic_nodes["my_report_agent"] = {
+            "system_prompt": "my_report_agent",
+            "node_class": "gen_visual_report",
+            "tools": "db_tools.*",
+            "max_turns": 5,
+        }
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "my_report_agent", "test-session")
+        assert isinstance(node, GenVisualReportAgenticNode)
+        assert not isinstance(node, GenSQLAgenticNode)
+
+    def test_custom_agent_type_ask_metrics(self, real_agent_config, mock_llm_create):
+        """API-created type=ask_metrics agents must instantiate AskMetricsAgenticNode."""
+        from manager.agent.node.ask_metrics_agentic_node import AskMetricsAgenticNode
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+
+        real_agent_config.agentic_nodes["my_metric_agent"] = {
+            "system_prompt": "my_metric_agent",
+            "type": "ask_metrics",
+            "tools": "semantic_tools.query_metrics",
+            "max_turns": 5,
+        }
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "my_metric_agent", "test-session")
+        assert isinstance(node, AskMetricsAgenticNode)
+        assert not isinstance(node, GenSQLAgenticNode)
+
+    def test_custom_agent_no_node_class_falls_back_to_gen_sql(self, real_agent_config, mock_llm_create):
+        """A custom sub_agent without node_class must default to GenSQLAgenticNode."""
+        from manager.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+
+        real_agent_config.agentic_nodes["plain_custom_agent"] = {
+            "system_prompt": "plain_custom_agent",
+            "tools": "db_tools.*",
+            "max_turns": 5,
+        }
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "plain_custom_agent", "test-session")
+        assert isinstance(node, GenSQLAgenticNode)
+
+    def test_custom_agent_uuid_resolved_to_node_class(self, real_agent_config, mock_llm_create):
+        """API passes the UUID under "id"; factory must look up the name and honour node_class."""
+        from manager.agent.node.gen_visual_report_agentic_node import GenVisualReportAgenticNode
+
+        real_agent_config.agentic_nodes["my_report_agent"] = {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "system_prompt": "my_report_agent",
+            "node_class": "gen_visual_report",
+            "tools": "db_tools.*",
+            "max_turns": 5,
+        }
+
+        manager = ChatTaskManager()
+        node = manager._create_node(
+            real_agent_config,
+            "11111111-2222-3333-4444-555555555555",
+            "test-session",
+        )
+        assert isinstance(node, GenVisualReportAgenticNode)
+
+
+class TestCreateNodeInput:
+    """Tests for _create_node_input — input model factory."""
+
+    def test_gen_sql_node_input(self, real_agent_config, mock_llm_create):
+        """_create_node_input for GenSQLAgenticNode returns GenSQLNodeInput."""
+        from manager.schemas.gen_sql_agentic_node_models import GenSQLNodeInput
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_sql", "test")
+        result = manager._create_node_input("test query", node, [], [], [])
+        assert isinstance(result, GenSQLNodeInput)
+        assert result.user_message == "test query"
+
+    def test_default_node_input(self, real_agent_config, mock_llm_create):
+        """_create_node_input for default node returns valid input."""
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, None, "test")
+        result = manager._create_node_input("hello", node, [], [], [])
+        assert result.user_message == "hello"
+
+    def test_sql_summary_node_input(self, real_agent_config, mock_llm_create):
+        """_create_node_input for SqlSummaryAgenticNode returns SqlSummaryNodeInput."""
+        from manager.schemas.sql_summary_agentic_node_models import SqlSummaryNodeInput
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_sql_summary", "test")
+        result = manager._create_node_input("summarize sql", node, [], [], [])
+        assert isinstance(result, SqlSummaryNodeInput)
+
+    def test_node_input_with_db_context(self, real_agent_config, mock_llm_create):
+        """_create_node_input passes database context through."""
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_sql", "test")
+        result = manager._create_node_input(
+            "test",
+            node,
+            [],
+            [],
+            [],
+            catalog="cat",
+            database="db",
+            db_schema="schema",
+        )
+        assert result.catalog == "cat"
+        assert result.database == "db"
+        assert result.db_schema == "schema"
+
+    def test_node_input_falls_back_to_config_db_context(self, real_agent_config, mock_llm_create):
+        """_create_node_input fills missing database context from current config."""
+        real_agent_config.current_db_config().type = "postgresql"
+        real_agent_config.current_db_config().uri = ""
+        real_agent_config.current_db_config().catalog = "configured_catalog"
+        real_agent_config.current_db_config().database = "configured_database"
+        real_agent_config.current_db_config().schema = "configured_schema"
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_sql", "test")
+        result = manager._create_node_input("test", node, [], [], [])
+
+        assert result.catalog == "configured_catalog"
+        assert result.database == "configured_database"
+        assert result.db_schema == "configured_schema"
+
+    def test_resolved_empty_schema_survives_node_input_and_semantic_context(self, real_agent_config, mock_llm_create):
+        cfg = real_agent_config.current_db_config()
+        cfg.schema = "configured_schema"
+        real_agent_config.set_runtime_db_context(
+            datasource=real_agent_config.current_datasource, database=cfg.database, schema="", catalog=""
+        )
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "gen_sql", "cleared-schema")
+        result = manager._create_node_input("query", node, [], [], [], catalog="", database=cfg.database, db_schema="")
+        assert result.db_schema == ""
+        node.input = result
+        assert node._semantic_runtime_db_context()["schema"] == ""
+
+    def test_feedback_node_input_with_source_session(self, real_agent_config, mock_llm_create):
+        """_create_node_input for FeedbackAgenticNode carries source_session_id through."""
+        from manager.agent.node.feedback_agentic_node import FeedbackAgenticNode
+        from manager.schemas.feedback_agentic_node_models import FeedbackNodeInput
+
+        manager = ChatTaskManager()
+        node = manager._create_node(real_agent_config, "feedback", "test")
+        assert isinstance(node, FeedbackAgenticNode)
+
+        result = manager._create_node_input(
+            '[The user reacted to this message "reply" with [thumbsup]]',
+            node,
+            [],
+            [],
+            [],
+            database="db",
+            source_session_id="chat_session_xyz",
+        )
+        assert isinstance(result, FeedbackNodeInput)
+        assert result.source_session_id == "chat_session_xyz"
+        assert result.database == "db"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for thinking-delta tests
+# ---------------------------------------------------------------------------
+
+
+def _make_thinking_delta(event_id: int, text: str, message_id: str = "m1", data_type=SSEDataType.APPEND_MESSAGE):
+    """Create a thinking-delta SSEEvent."""
+    return SSEEvent(
+        id=event_id,
+        event="message",
+        data=SSEMessageData(
+            type=data_type,
+            payload=SSEMessagePayload(
+                message_id=message_id,
+                role="assistant",
+                content=[IMessageContent(type="thinking", payload={"content": text})],
+            ),
+        ),
+        timestamp="2025-01-01T00:00:00Z",
+    )
+
+
+def _make_markdown_event(event_id: int, text: str, message_id: str = "m1"):
+    """Create a non-delta markdown message SSEEvent."""
+    return SSEEvent(
+        id=event_id,
+        event="message",
+        data=SSEMessageData(
+            type=SSEDataType.APPEND_MESSAGE,
+            payload=SSEMessagePayload(
+                message_id=message_id,
+                role="assistant",
+                content=[IMessageContent(type="markdown", payload={"content": text})],
+            ),
+        ),
+        timestamp="2025-01-01T00:00:00Z",
+    )
+
+
+def _make_ping_event(event_id: int = -1):
+    return SSEEvent(id=event_id, event="ping", data=SSEPingData(), timestamp="2025-01-01T00:00:00Z")
+
+
+# ---------------------------------------------------------------------------
+# _is_thinking_delta tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsThinkingDelta:
+    """Tests for _is_thinking_delta identification."""
+
+    def test_positive_append(self):
+        """Correctly identifies APPEND_MESSAGE thinking delta."""
+        ev = _make_thinking_delta(0, "hello")
+        assert _is_thinking_delta(ev) is True
+
+    def test_positive_create(self):
+        """Correctly identifies CREATE_MESSAGE thinking delta."""
+        ev = _make_thinking_delta(0, "hello", data_type=SSEDataType.CREATE_MESSAGE)
+        assert _is_thinking_delta(ev) is True
+
+    def test_negative_markdown(self):
+        """Markdown content is not a thinking delta."""
+        ev = _make_markdown_event(0, "hello")
+        assert _is_thinking_delta(ev) is False
+
+    def test_negative_update_message(self):
+        """UPDATE_MESSAGE is not a thinking delta."""
+        ev = SSEEvent(
+            id=0,
+            event="message",
+            data=SSEMessageData(
+                type=SSEDataType.UPDATE_MESSAGE,
+                payload=SSEMessagePayload(
+                    message_id="m1",
+                    role="assistant",
+                    content=[IMessageContent(type="thinking", payload={"content": "x"})],
+                ),
+            ),
+            timestamp="t",
+        )
+        assert _is_thinking_delta(ev) is False
+
+    def test_negative_ping_event(self):
+        """Ping event is not a thinking delta."""
+        ev = _make_ping_event()
+        assert _is_thinking_delta(ev) is False
+
+    def test_negative_empty_content(self):
+        """Empty content list is not a thinking delta."""
+        ev = SSEEvent(
+            id=0,
+            event="message",
+            data=SSEMessageData(
+                type=SSEDataType.APPEND_MESSAGE,
+                payload=SSEMessagePayload(message_id="m1", role="assistant", content=[]),
+            ),
+            timestamp="t",
+        )
+        assert _is_thinking_delta(ev) is False
+
+
+# ---------------------------------------------------------------------------
+# _coalesce_deltas tests
+# ---------------------------------------------------------------------------
+
+
+class TestCoalesceDeltas:
+    """Tests for _coalesce_deltas batch merging."""
+
+    def test_empty_list(self):
+        """Empty list returns empty list."""
+        assert _coalesce_deltas([]) == []
+
+    def test_single_delta(self):
+        """Single delta is returned unchanged."""
+        ev = _make_thinking_delta(0, "hi")
+        result = _coalesce_deltas([ev])
+        assert len(result) == 1
+        assert result[0] is ev  # same object, no copy needed
+
+    def test_merges_consecutive(self):
+        """3 consecutive deltas merge into 1 with concatenated text."""
+        evts = [_make_thinking_delta(i, f"part{i}") for i in range(3)]
+        result = _coalesce_deltas(evts)
+        assert len(result) == 1
+        merged = result[0]
+        assert merged.id == 0  # retains first event's id
+        data = merged.data
+        assert isinstance(data, SSEMessageData)
+        assert data.payload.content[0].payload["content"] == "part0part1part2"
+
+    def test_preserves_non_delta(self):
+        """Non-delta events pass through unchanged."""
+        md = _make_markdown_event(0, "hello")
+        ping = _make_ping_event(1)
+        result = _coalesce_deltas([md, ping])
+        assert len(result) == 2
+        assert result[0] is md
+        assert result[1] is ping
+
+    def test_mixed_sequence(self):
+        """delta + non-delta + delta → 3 events (non-delta breaks run)."""
+        d1 = _make_thinking_delta(0, "a")
+        md = _make_markdown_event(1, "break")
+        d2 = _make_thinking_delta(2, "b")
+        result = _coalesce_deltas([d1, md, d2])
+        assert len(result) == 3
+        # First is the lone delta (unchanged)
+        assert result[0] is d1
+        # Second is the markdown
+        assert result[1] is md
+        # Third is the lone delta (unchanged)
+        assert result[2] is d2
+
+    def test_trailing_delta_run(self):
+        """Non-delta followed by multiple deltas → 2 events."""
+        md = _make_markdown_event(0, "start")
+        d1 = _make_thinking_delta(1, "x")
+        d2 = _make_thinking_delta(2, "y")
+        result = _coalesce_deltas([md, d1, d2])
+        assert len(result) == 2
+        assert result[0] is md
+        data = result[1].data
+        assert isinstance(data, SSEMessageData)
+        assert data.payload.content[0].payload["content"] == "xy"
+
+    def test_different_message_ids_break_run(self):
+        """Consecutive deltas with different message_ids are NOT merged."""
+        d1 = _make_thinking_delta(0, "a", message_id="m1")
+        d2 = _make_thinking_delta(1, "b", message_id="m1")
+        d3 = _make_thinking_delta(2, "c", message_id="m2")
+        d4 = _make_thinking_delta(3, "d", message_id="m2")
+        result = _coalesce_deltas([d1, d2, d3, d4])
+        # Should produce 2 merged events (one per message_id)
+        assert len(result) == 2
+        data0 = result[0].data
+        data1 = result[1].data
+        assert isinstance(data0, SSEMessageData)
+        assert isinstance(data1, SSEMessageData)
+        assert data0.payload.message_id == "m1"
+        assert data0.payload.content[0].payload["content"] == "ab"
+        assert data1.payload.message_id == "m2"
+        assert data1.payload.content[0].payload["content"] == "cd"
+
+
+# ---------------------------------------------------------------------------
+# Integration: consume_events with coalescing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConsumeEventsCoalescing:
+    """Integration test: queued deltas are coalesced during consumption."""
+
+    async def test_consume_events_coalesces_queued_deltas(self, monkeypatch):
+        """Multiple queued thinking deltas are yielded as a single merged event."""
+        from manager.api.services import chat_task_manager as ctm
+
+        monkeypatch.setattr(ctm, "HEARTBEAT_INTERVAL", 0.05)
+
+        manager = ChatTaskManager()
+        task = ChatTask(session_id="coalesce-test", asyncio_task=MagicMock())
+        task.status = "running"
+        manager._tasks["coalesce-test"] = task
+
+        # Push 3 thinking deltas while consumer is not running
+        for i in range(3):
+            await manager._push_event(task, _make_thinking_delta(i, f"chunk{i}"))
+
+        # Mark done so consumer exits after draining
+        async with task.condition:
+            task.status = "completed"
+            task.condition.notify_all()
+
+        events = []
+        async for e in manager.consume_events(task, start_from=0):
+            events.append(e)
+
+        # Should receive 1 merged event instead of 3
+        assert len(events) == 1
+        data = events[0].data
+        assert isinstance(data, SSEMessageData)
+        assert data.payload.content[0].payload["content"] == "chunk0chunk1chunk2"
+
+        # cursor should have advanced past all 3 original events
+        assert task.consumer_offset == 3
+
+
+@pytest.mark.asyncio
+class TestRunLoopPathManagerContext:
+    """Regression: _run_loop must pin agent_config.path_manager into its own context.
+
+    The gateway bridge dispatches messages from a Feishu SDK worker thread via
+    ``asyncio.run_coroutine_threadsafe``. That thread never inherited the
+    ContextVar set by ``AgentConfig.__init__``, so the spawned task starts
+    with an empty ``_current_path_manager`` and downstream stores
+    (``BaseSubjectEmbeddingStore`` -> ``get_subject_tree_store``) would fall
+    back to a path manager with empty ``project_name``, raising
+    ``create_rdb_for_store requires a non-empty project``.
+    """
+
+    async def test_run_loop_sets_path_manager_when_context_is_empty(self, real_agent_config, mock_llm_create):
+        """Even when the calling context has no path manager, _run_loop binds
+        agent_config.path_manager so downstream get_path_manager() callers see
+        the right project_name."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.utils.path_manager import (
+            _current_path_manager,
+            get_path_manager,
+            reset_path_manager,
+        )
+
+        captured: dict[str, str] = {}
+
+        original_create_node = ChatTaskManager._create_node
+
+        def _capturing_create_node(self, agent_config, subagent_id, node_id, **kwargs):
+            # Simulate what BaseSubjectEmbeddingStore.__init__ does at line 692:
+            # rely on the ambient ContextVar to find the project name.
+            captured["project_name"] = get_path_manager().project_name
+            return original_create_node(self, agent_config, subagent_id, node_id, **kwargs)
+
+        manager = ChatTaskManager()
+        manager._create_node = _capturing_create_node.__get__(manager, ChatTaskManager)  # type: ignore[method-assign]
+
+        # Wipe the ContextVar to mimic the Feishu-thread dispatch case. The
+        # task created by start_chat will inherit this empty context.
+        token = _current_path_manager.set(None)
+        try:
+            assert _current_path_manager.get() is None
+            request = StreamChatInput(message="hello", session_id="path-mgr-test")
+            task = await manager.start_chat(real_agent_config, request)
+            # Wait for the background loop to finish (mock LLM returns immediately).
+            await asyncio.wait_for(task.asyncio_task, timeout=5.0)
+        finally:
+            reset_path_manager(token)
+            await manager.shutdown()
+
+        expected = real_agent_config.project_name
+        assert expected, "real_agent_config.project_name must be non-empty for this test"
+        assert captured.get("project_name") == expected, (
+            f"_run_loop did not pin path_manager: got {captured.get('project_name')!r}, expected {expected!r}"
+        )
+
+    async def test_run_loop_does_not_leak_path_manager_to_caller(self, real_agent_config, mock_llm_create):
+        """The ContextVar.set inside _run_loop must stay scoped to its own task
+        and not bleed back into the calling context."""
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.utils.path_manager import _current_path_manager, reset_path_manager
+
+        manager = ChatTaskManager()
+        token = _current_path_manager.set(None)
+        try:
+            request = StreamChatInput(message="hello", session_id="leak-test")
+            task = await manager.start_chat(real_agent_config, request)
+            await asyncio.wait_for(task.asyncio_task, timeout=5.0)
+            # Caller's view stays untouched: the spawned task has its own context.
+            assert _current_path_manager.get() is None
+        finally:
+            reset_path_manager(token)
+            await manager.shutdown()
+
+
+class _StubGenSQLNode:
+    def __init__(self, **kwargs):
+        self.node_name = kwargs.get("node_name")
+        self.kwargs = kwargs
+
+
+class TestCreateNodeCustomSubAgent:
+    """Tests for _create_node custom sub_agent branch — node_name resolution."""
+
+    def test_custom_subagent_resolves_sanitized_key(self, monkeypatch):
+        """Custom sub_agent UUID resolves to sanitized node_name via agentic_nodes."""
+        monkeypatch.setattr(
+            "manager.agent.node.gen_sql_agentic_node.GenSQLAgenticNode",
+            _StubGenSQLNode,
+        )
+        agent_config = MagicMock()
+        agent_config.agentic_nodes = {
+            "my_sanitized_name": {"id": "uuid-123", "system_prompt": "my_sanitized_name"},
+        }
+        node = ChatTaskManager()._create_node(agent_config, "uuid-123", "s1")
+        assert isinstance(node, _StubGenSQLNode)
+        assert node.node_name == "my_sanitized_name"
+
+    def test_custom_subagent_unknown_falls_back_to_id(self, monkeypatch):
+        """Unknown subagent_id is used as-is when no matching entry exists."""
+        monkeypatch.setattr(
+            "manager.agent.node.gen_sql_agentic_node.GenSQLAgenticNode",
+            _StubGenSQLNode,
+        )
+        agent_config = MagicMock()
+        agent_config.agentic_nodes = {
+            "my_sanitized_name": {"id": "uuid-123", "system_prompt": "my_sanitized_name"},
+        }
+        node = ChatTaskManager()._create_node(agent_config, "unknown", "s1")
+        assert isinstance(node, _StubGenSQLNode)
+        assert node.node_name == "unknown"
+
+
+class TestStartChatLanguageOverride:
+    """``StreamChatInput.language`` must land on the cloned config's
+    ``language`` attribute so every downstream AgenticNode sees it.
+
+    We short-circuit the async loop to avoid spinning up real nodes: the
+    override happens synchronously inside ``start_chat`` before
+    ``_run_loop`` is awaited.
+    """
+
+    @pytest.mark.asyncio
+    async def test_request_language_overrides_cloned_config(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.language = "en"
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", language="zh")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task  # drain the fake loop
+        assert captured["agent_config"].language == "zh"
+        # Source config remains untouched because start_chat deep-copies.
+        assert real_agent_config.language == "en"
+
+    @pytest.mark.asyncio
+    async def test_missing_language_preserves_yaml_default(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.language = "zh"
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi")  # no language field
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert captured["agent_config"].language == "zh"
+
+
+class TestStartChatModelOverride:
+    """``ChatInput.model`` (format ``provider/model_id``) must override the
+    cloned config's active model with the highest priority.
+    """
+
+    @pytest.mark.asyncio
+    async def test_provider_model_override(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", model="openai/gpt-4.1")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert captured["agent_config"]._target_provider == "openai"
+        assert captured["agent_config"]._target_model == "gpt-4.1"
+
+    @pytest.mark.asyncio
+    async def test_custom_model_override(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", model="custom/mock")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert captured["agent_config"].target == "mock"
+        assert captured["agent_config"]._target_provider is None
+        assert captured["agent_config"]._target_model is None
+
+    @pytest.mark.asyncio
+    async def test_model_with_slash_in_id(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", model="openai/org/gpt-4.1")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert captured["agent_config"]._target_provider == "openai"
+        assert captured["agent_config"]._target_model == "org/gpt-4.1"
+
+    @pytest.mark.asyncio
+    async def test_model_without_slash_raises(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            pass
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", model="gpt-4.1")
+        with pytest.raises(ValueError, match="expected 'provider/model_id'"):
+            await manager.start_chat(real_agent_config, request)
+
+    @pytest.mark.asyncio
+    async def test_model_none_preserves_config(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert captured["agent_config"].target == real_agent_config.target
+
+    @pytest.mark.asyncio
+    async def test_model_override_does_not_mutate_source(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        original_target = real_agent_config.target
+        original_target_provider = real_agent_config._target_provider
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            pass
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", model="openai/gpt-4.1")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+        assert real_agent_config.target == original_target
+        assert real_agent_config._target_provider == original_target_provider
+
+    @pytest.mark.asyncio
+    async def test_custom_model_unknown_raises(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.utils.exceptions import ManagerException
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            pass
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", model="custom/nonexistent")
+        with pytest.raises(ManagerException):
+            await manager.start_chat(real_agent_config, request)
+
+
+class TestStartChatRemoteSourceHardening:
+    """Per-source bash policy for remote front-ends.
+    ``filesystem_strict`` is always on for the API surface. vscode owns its
+    own local shell, so ``bash_tool_enabled`` is forced off; web runs a full
+    server-side bash (``bash_allowed_patterns = ["*"]``) confined by the
+    strict OS sandbox (``bash_sandbox.enabled`` + ``mode == "strict"``).
+    ``project_root`` is intentionally untouched — web keeps its configured
+    root and the read-only property falls back to CWD when empty.
+    """
+
+    @pytest.mark.asyncio
+    async def test_vscode_source_disables_bash_tool(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = True
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", source="vscode", session_id="vscode-hardening")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.filesystem_strict is True
+        assert cfg.bash_tool_enabled is False
+        assert cfg._client_source == "vscode"
+        # vscode never gets a restricted-bash whitelist — the tool is gone.
+        assert cfg.bash_allowed_patterns == ["*"]
+        # Source config remains untouched because start_chat deep-copies.
+        assert real_agent_config.bash_tool_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_web_source_allows_all_bash_under_strict_sandbox(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = True
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", source="web", session_id="web-hardening")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.filesystem_strict is True
+        # web runs a full bash confined by the strict OS sandbox, not a whitelist.
+        assert cfg.bash_tool_enabled is True
+        assert cfg.bash_allowed_patterns == ["*"]
+        assert cfg.bash_sandbox.enabled is True
+        assert cfg.bash_sandbox.is_strict is True
+        assert cfg._client_source == "web"
+        # Source config remains untouched because start_chat deep-copies.
+        assert real_agent_config.bash_allowed_patterns == ["*"]
+        assert real_agent_config.bash_sandbox.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_web_source_respects_yaml_bash_disable(self, real_agent_config, monkeypatch):
+        """An agent.yml ``bash.enabled: false`` still wins under web —
+        allowing all commands or enabling the sandbox must never re-enable a
+        disabled tool."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = False
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", source="web", session_id="web-yaml-disabled")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.bash_tool_enabled is False
+        assert cfg.bash_allowed_patterns == ["*"]
+
+    @pytest.mark.asyncio
+    async def test_default_source_web_applies_strict_sandbox_without_request_source(
+        self, real_agent_config, monkeypatch
+    ):
+        """A daemon launched with --source web applies the full-bash +
+        strict-sandbox policy to every request that does not override source."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = True
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager(default_source="web")
+        request = StreamChatInput(message="hi", session_id="default-web-hardening")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.bash_tool_enabled is True
+        assert cfg.bash_allowed_patterns == ["*"]
+        assert cfg.bash_sandbox.is_strict is True
+
+    @pytest.mark.asyncio
+    async def test_default_source_vscode_applies_hardening_without_request_source(self, real_agent_config, monkeypatch):
+        """A daemon launched with --source vscode hardens every request that
+        does not override source explicitly."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = True
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager(default_source="vscode")
+        request = StreamChatInput(message="hi", session_id="default-vscode-hardening")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.bash_tool_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_no_source_preserves_bash_settings(self, real_agent_config, monkeypatch):
+        """CLI / no-source requests keep whatever bash_tool_enabled value was
+        in agent.yml. Only filesystem_strict is unconditionally forced on for
+        the API surface."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.bash_tool_enabled = True
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()  # default_source=None
+        request = StreamChatInput(message="hi", session_id="no-source-baseline")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        assert cfg.filesystem_strict is True
+        assert cfg.bash_tool_enabled is True
+        assert cfg.bash_allowed_patterns == ["*"]
+        assert cfg._client_source is None
+
+
+class TestStartChatDatasourceOverride:
+    """A per-request ``datasource`` (e.g. an IM channel override) switches the
+    connection profile without leaking into the physical ``database`` slot."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("engine", ["sqlite", "duckdb"])
+    @pytest.mark.parametrize("explicit_empty", [False, True])
+    async def test_glob_database_omission_uses_effective_default_but_explicit_empty_rejects(
+        self, tmp_path, monkeypatch, engine, explicit_empty
+    ):
+        import sqlite3
+
+        import duckdb
+
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.configuration.agent_config import AgentConfig
+        from manager.tools.func_tool.database import DBFuncTool
+
+        suffix = "sqlite" if engine == "sqlite" else "duckdb"
+        path = tmp_path / f"analytics.{suffix}"
+        connect = sqlite3.connect if engine == "sqlite" else duckdb.connect
+        with connect(str(path)) as conn:
+            conn.execute("CREATE TABLE marker(value INTEGER)")
+            conn.execute("INSERT INTO marker VALUES (25)")
+        cfg = AgentConfig(
+            nodes={},
+            home=str(tmp_path / "home"),
+            target="mock",
+            skip_init_dirs=True,
+            models={"mock": {"type": "openai", "api_key": "unused", "model": "unused"}},
+            services={
+                "datasources": {
+                    "warehouse": {
+                        "type": engine,
+                        "path_pattern": str(tmp_path / f"*.{suffix}"),
+                        "default": True,
+                    }
+                }
+            },
+        )
+        cfg.override_by_args()
+        assert cfg.current_db_config().database == ""
+        observed = {}
+
+        async def run(task, config, request, **kwargs):
+            observed.update(config.runtime_db_context())
+            if explicit_empty:
+                with pytest.raises(ValueError, match="Select a database explicitly"):
+                    DBFuncTool(agent_config=config)
+            else:
+                tool = DBFuncTool(agent_config=config)
+                try:
+                    result = tool.connector.execute_query("SELECT value FROM marker", result_format="list")
+                    assert result.success is True, result.error
+                    assert result.sql_return == [{"value": 25}]
+                finally:
+                    tool._db_manager.close()
+
+        manager = ChatTaskManager()
+        monkeypatch.setattr(manager, "_run_loop", run)
+        request = StreamChatInput(message="query", **({"database": ""} if explicit_empty else {}))
+        task = await manager.start_chat(cfg, request)
+        await task.asyncio_task
+        assert observed["database"] == ("" if explicit_empty else "analytics")
+        assert cfg.current_db_config().database == ""
+        assert cfg.runtime_db_context() == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "selection,expected",
+        [
+            ({"catalog": "cat_b"}, {"catalog": "cat_b"}),
+            ({"db_schema": ""}, {"catalog": "cat_a", "database": "analytics"}),
+            ({"database": "other"}, {"catalog": "cat_a", "database": "other"}),
+            ({}, {"catalog": "cat_a", "database": "analytics", "schema": "tenant_a"}),
+        ],
+    )
+    async def test_parent_changes_invalidate_children_and_empty_schema_is_explicit(
+        self, real_agent_config, monkeypatch, selection, expected
+    ):
+        import json
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        source = real_agent_config.current_datasource
+        cfg = real_agent_config.current_db_config()
+        cfg.catalog, cfg.database, cfg.schema = "cat_a", "analytics", "tenant_a"
+        previous = {"datasource": source, "catalog": "cat_a", "database": "analytics", "schema": "tenant_a"}
+        manager = ChatTaskManager()
+        sessions = MagicMock()
+        sessions.load_session_meta.return_value = json.dumps(previous)
+        monkeypatch.setattr(manager, "_session_manager", lambda *args: sessions)
+        captured = {}
+
+        async def run(task, config, request, **kwargs):
+            captured.update(config.runtime_db_context())
+
+        monkeypatch.setattr(manager, "_run_loop", run)
+        task = await manager.start_chat(
+            real_agent_config, StreamChatInput(message="query", session_id="hierarchy", **selection)
+        )
+        await task.asyncio_task
+        from manager.schemas.database_context import DatabaseExecutionContext
+
+        assert DatabaseExecutionContext.from_mapping(captured).to_dict() == {"datasource": source, **expected}
+
+    @pytest.mark.asyncio
+    async def test_request_datasource_switches_current_datasource(self, real_agent_config, monkeypatch):
+        import copy as _copy
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        # Inject a second datasource so the switch is observable (not a no-op).
+        sources = real_agent_config.services.datasources
+        sources["analytics"] = _copy.deepcopy(sources["california_schools"])
+        assert real_agent_config.current_datasource == "california_schools"
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["agent_config"] = agent_config
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(message="hi", session_id="ds-override", datasource="analytics")
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        cfg = captured["agent_config"]
+        # The cloned config switched datasource; the datasource name never landed in database
+        # (database, if filled by _fill_database_context, is the resolved physical db name).
+        assert cfg.current_datasource == "analytics"
+        assert request.database != "analytics"
+        # Original config untouched because start_chat deep-copies.
+        assert real_agent_config.current_datasource == "california_schools"
+
+    @pytest.mark.asyncio
+    async def test_unbound_datasource_refuses_to_execute_on_a_different_target(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+
+        called = []
+
+        async def run(*args, **kwargs):
+            called.append(True)
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", run)
+        manager = ChatTaskManager()
+        with pytest.raises(ValueError, match="not bound"):
+            await manager.start_chat(
+                real_agent_config, StreamChatInput(message="hi", datasource="not_bound", database="picked_db")
+            )
+        assert called == []
+        assert real_agent_config.current_datasource == "california_schools"
+
+    @pytest.mark.asyncio
+    async def test_bound_request_datasource_keeps_its_database_context(self, real_agent_config, monkeypatch):
+        """A selection that still resolves is left exactly as the client sent it."""
+        from manager.api.models.cli_models import StreamChatInput
+
+        captured = {}
+
+        async def fake_run_loop(self, task, agent_config, request, **kwargs):
+            captured["database"] = request.database
+            captured["db_schema"] = request.db_schema
+
+        monkeypatch.setattr(ChatTaskManager, "_run_loop", fake_run_loop)
+        manager = ChatTaskManager()
+        request = StreamChatInput(
+            message="hi",
+            session_id="ds-valid-ctx",
+            datasource="california_schools",
+            database="picked_db",
+            db_schema="picked_schema",
+        )
+        task = await manager.start_chat(real_agent_config, request)
+        await task.asyncio_task
+
+        assert captured["database"] == "picked_db"
+        assert captured["db_schema"] == "picked_schema"
+
+
+class TestMatchTableEntry:
+    """_match_table_entry — resilient @Table resolution when the picker's
+    fullName (live introspection) diverges from the metadata-store key."""
+
+    FLAT = {
+        "sample_shop.main.raw_stores": {
+            "table_name": "raw_stores",
+            "database_name": "sample_shop",
+            "schema_name": "main",
+            "definition": "x",
+            "identifier": "i",
+        },
+        "sample_shop.main.raw_orders": {
+            "table_name": "raw_orders",
+            "database_name": "sample_shop",
+            "schema_name": "main",
+            "definition": "x",
+            "identifier": "i",
+        },
+    }
+
+    def test_catalog_prefix_mismatch_resolves(self):
+        entry = ChatTaskManager._match_table_entry(self.FLAT, "default_catalog.sample_shop.raw_stores")
+        assert entry and entry["table_name"] == "raw_stores"
+
+    def test_bare_db_table_resolves(self):
+        entry = ChatTaskManager._match_table_entry(self.FLAT, "sample_shop.raw_stores")
+        assert entry and entry["table_name"] == "raw_stores"
+
+    def test_unknown_table_returns_none(self):
+        assert ChatTaskManager._match_table_entry(self.FLAT, "default_catalog.sample_shop.nope") is None
+
+    def test_ambiguous_without_db_returns_none(self):
+        amb = {
+            "db1.t": {"table_name": "t", "database_name": "db1"},
+            "db2.t": {"table_name": "t", "database_name": "db2"},
+        }
+        assert ChatTaskManager._match_table_entry(amb, "t") is None
+
+    def test_ambiguous_disambiguated_by_db(self):
+        amb = {
+            "db1.t": {"table_name": "t", "database_name": "db1"},
+            "db2.t": {"table_name": "t", "database_name": "db2"},
+        }
+        entry = ChatTaskManager._match_table_entry(amb, "db2.t")
+        assert entry and entry["database_name"] == "db2"
+
+    def test_sqlite_single_level_resolves(self):
+        flat = {"raw_stores": {"table_name": "raw_stores", "definition": "x"}}
+        entry = ChatTaskManager._match_table_entry(flat, "raw_stores")
+        assert entry and entry["table_name"] == "raw_stores"
+
+
+class TestSynthesizeTableEntry:
+    """_synthesize_table_entry — name-only fallback when the metadata store
+    can't resolve a picked @Table (KB not indexed for the datasource)."""
+
+    def test_three_part_path(self):
+        from manager.schemas.node_models import TableSchema
+
+        entry = ChatTaskManager._synthesize_table_entry("default_catalog.sample_shop.raw_orders")
+        assert entry["table_name"] == "raw_orders"
+        assert entry["database_name"] == "sample_shop"
+        # Must build a valid TableSchema and render to its own name in the prompt.
+        ts = TableSchema.from_dict(entry)
+        assert TableSchema.table_names_to_prompt([ts]) == "raw_orders"
+
+    def test_single_segment(self):
+        entry = ChatTaskManager._synthesize_table_entry("raw_orders")
+        assert entry["table_name"] == "raw_orders"
+        assert entry["database_name"] == ""
+
+    def test_empty_path(self):
+        assert ChatTaskManager._synthesize_table_entry("") is None
+
+
+class TestSplitSubjectPath:
+    """_split_subject_path — (subject_path, name) from a picked ref path."""
+
+    def test_slash_joined(self):
+        assert ChatTaskManager._split_subject_path("Commerce/Orders/aov") == (["Commerce", "Orders"], "aov")
+
+    def test_dot_joined_when_no_slash(self):
+        assert ChatTaskManager._split_subject_path("Commerce.Orders.aov") == (["Commerce", "Orders"], "aov")
+
+    def test_slash_present_preserves_dot_in_name(self):
+        assert ChatTaskManager._split_subject_path("A/B/v1.2") == (["A", "B"], "v1.2")
+
+    def test_single_segment(self):
+        assert ChatTaskManager._split_subject_path("aov") == ([], "aov")
+
+    def test_empty(self):
+        assert ChatTaskManager._split_subject_path("") == ([], "")
+
+
+class TestResolveMetricSqlPaths:
+    """@Metric/@Sql resolve by exact subject path via the non-vector store
+    lookup."""
+
+    def test_metric_uses_path_scoped_detail_lookup(self):
+        mgr = ChatTaskManager()
+        fake_rag = MagicMock()
+        fake_rag.get_metrics_detail.return_value = [{"name": "aov", "description": "avg order value"}]
+        with patch("manager.storage.metric.store.MetricRAG", return_value=fake_rag):
+            metrics, hints = mgr._resolve_metric_paths(MagicMock(), ["Commerce/Orders/aov"])
+        fake_rag.get_metrics_detail.assert_called_once_with(subject_path=["Commerce", "Orders"], name="aov")
+        assert len(metrics) == 1 and metrics[0].name == "aov"
+        # subject_path must survive into the resolved metric (authoritative from
+        # the picked path), so the prompt can name where it lives.
+        assert metrics[0].subject_path == ["Commerce", "Orders"]
+        assert hints == []
+
+    def test_metric_unresolved_becomes_hint(self):
+        mgr = ChatTaskManager()
+        fake_rag = MagicMock()
+        fake_rag.get_metrics_detail.return_value = []
+        with patch("manager.storage.metric.store.MetricRAG", return_value=fake_rag):
+            metrics, hints = mgr._resolve_metric_paths(MagicMock(), ["A/b/missing"])
+        assert metrics == []
+        assert hints == [{"kind": "metric", "name": "missing", "subject_path": ["A", "b"]}]
+
+    def test_sql_uses_path_scoped_detail_lookup(self):
+        mgr = ChatTaskManager()
+        fake_store = MagicMock()
+        # Store returns optional string columns as None (no comment/tags) —
+        # must still build a valid ReferenceSql (regression: pydantic rejected None).
+        fake_store.get_reference_sql_detail.return_value = [
+            {"name": "q", "sql": "select 1", "summary": None, "comment": None, "tags": None}
+        ]
+        with patch("manager.storage.reference_sql.store.ReferenceSqlRAG", return_value=fake_store):
+            sqls, hints = mgr._resolve_sql_paths(MagicMock(), ["main/q"])
+        fake_store.get_reference_sql_detail.assert_called_once_with(subject_path=["main"], name="q")
+        assert len(sqls) == 1 and sqls[0].sql == "select 1"
+        assert sqls[0].comment == "" and sqls[0].tags == ""
+        assert sqls[0].subject_path == ["main"]
+        assert hints == []
+
+    def test_metric_none_description_coerced(self):
+        mgr = ChatTaskManager()
+        fake_rag = MagicMock()
+        fake_rag.get_metrics_detail.return_value = [{"name": "aov", "description": None}]
+        with patch("manager.storage.metric.store.MetricRAG", return_value=fake_rag):
+            metrics, _ = mgr._resolve_metric_paths(MagicMock(), ["Commerce/aov"])
+        assert len(metrics) == 1 and metrics[0].name == "aov" and metrics[0].description == ""
+
+    def test_empty_paths_short_circuit(self):
+        mgr = ChatTaskManager()
+        assert mgr._resolve_metric_paths(MagicMock(), []) == ([], [])
+        assert mgr._resolve_sql_paths(MagicMock(), None) == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# Duplicate assistant-message suppression
+# ---------------------------------------------------------------------------
+
+
+def _make_assistant_message(text: str, message_id: str, data_type):
+    return SSEEvent(
+        id=1,
+        event="message",
+        data=SSEMessageData(
+            type=data_type,
+            payload=SSEMessagePayload(
+                message_id=message_id,
+                role="assistant",
+                content=[IMessageContent(type="markdown", payload={"content": text})],
+            ),
+        ),
+        timestamp="2025-01-01T00:00:00Z",
+    )
+
+
+def _response_action():
+    from manager.schemas.action_history import ActionRole, ActionStatus
+
+    return SimpleNamespace(role=ActionRole.ASSISTANT, status=ActionStatus.SUCCESS, action_type="response")
+
+
+class TestDuplicateAssistantMessage:
+    """One turn's text must reach the client once, whatever frame carries it."""
+
+    def test_repeated_create_is_skipped(self):
+        seen: dict[str, str] = {}
+        first = _make_assistant_message("same prose", "m1", SSEDataType.CREATE_MESSAGE)
+        _remember_assistant_message(first, seen)
+
+        again = _make_assistant_message("same prose", "m2", SSEDataType.CREATE_MESSAGE)
+        assert _should_skip_duplicate_assistant_message(_response_action(), again, seen) is True
+
+    def test_update_from_another_message_is_skipped(self):
+        """The reported bug: text + N parallel tool calls opens N streams that
+        each close with an UPDATE carrying the same prose."""
+        seen: dict[str, str] = {}
+        first = _make_assistant_message("parallel prose", "thinking_stream_a", SSEDataType.UPDATE_MESSAGE)
+        assert _should_skip_duplicate_assistant_message(_response_action(), first, seen) is False
+        _remember_assistant_message(first, seen)
+
+        for other in ("thinking_stream_b", "thinking_stream_c", "thinking_stream_d"):
+            twin = _make_assistant_message("parallel prose", other, SSEDataType.UPDATE_MESSAGE)
+            assert _should_skip_duplicate_assistant_message(_response_action(), twin, seen) is True
+
+    def test_update_on_its_own_message_passes(self):
+        """Overwriting one's own bubble is the legitimate UPDATE path — streamed
+        deltas replaced by the finished response, finalize_progress stages."""
+        seen: dict[str, str] = {}
+        first = _make_assistant_message("stage text", "m1", SSEDataType.CREATE_MESSAGE)
+        _remember_assistant_message(first, seen)
+
+        overwrite = _make_assistant_message("stage text", "m1", SSEDataType.UPDATE_MESSAGE)
+        assert _should_skip_duplicate_assistant_message(_response_action(), overwrite, seen) is False
+
+    def test_distinct_text_passes(self):
+        seen: dict[str, str] = {}
+        _remember_assistant_message(_make_assistant_message("first", "m1", SSEDataType.CREATE_MESSAGE), seen)
+
+        other = _make_assistant_message("second", "m2", SSEDataType.UPDATE_MESSAGE)
+        assert _should_skip_duplicate_assistant_message(_response_action(), other, seen) is False
+
+
+class TestReleaseStamp:
+    """The build identity is Manager' own fact, so Manager reads it."""
+
+    def test_release_prefers_the_deployed_image_tag(self, monkeypatch):
+        from manager.api.services.chat_task_manager import _release_stamp
+
+        monkeypatch.setenv("MANAGER_RELEASE", "0.4.0")
+        assert _release_stamp() == "0.4.0"
+
+    def test_release_falls_back_to_the_package_version(self, monkeypatch):
+        from manager import __version__
+        from manager.api.services.chat_task_manager import _release_stamp
+
+        monkeypatch.delenv("MANAGER_RELEASE", raising=False)
+        assert _release_stamp() == str(__version__)
+
+
+class TestRunLoopTurnStats:
+    """``_run_loop`` hands every finished turn to the turn-stats hook."""
+
+    @staticmethod
+    def _tool_actions(call_id, tool, ok=True):
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        start = ActionHistory(
+            action_id=call_id,
+            role=ActionRole.TOOL,
+            action_type=tool,
+            messages="",
+            input={"function_name": tool, "arguments": {}},
+            output={},
+            status=ActionStatus.PROCESSING,
+        )
+        done = ActionHistory(
+            action_id="complete_" + call_id,
+            role=ActionRole.TOOL,
+            action_type=tool,
+            messages="",
+            input={},
+            output={"success": ok},
+            status=ActionStatus.SUCCESS if ok else ActionStatus.FAILED,
+        )
+        return start, done
+
+    @staticmethod
+    def _fake_node(actions, raise_after=None):
+        class FakeNode:
+            session_id = "s-stats"
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                for action in actions:
+                    yield action
+                if raise_after is not None:
+                    raise raise_after
+
+            async def get_last_turn_usage(self):
+                return None
+
+        return FakeNode()
+
+    @staticmethod
+    def _recording_hook():
+        events = []
+
+        class Hook:
+            def capture_context(self, http_request, stream_request, user_id):
+                return {}
+
+            async def on_turn_finished(self, event):
+                events.append(event)
+
+        return Hook(), events
+
+    async def _run(self, real_agent_config, node, *, sub_agent_id=None, stats_context=None):
+        from manager.api.hooks import set_turn_stats_hook
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.api.services.background_drain import drain_background_tasks
+
+        hook, events = self._recording_hook()
+        set_turn_stats_hook(hook)
+        try:
+            manager = ChatTaskManager()
+            manager._create_node = lambda *args, **kwargs: node  # type: ignore[method-assign]
+            task = ChatTask(session_id="s-stats", asyncio_task=MagicMock())
+            task.stats_context = dict(stats_context or {})
+            await manager._run_loop(
+                task,
+                real_agent_config,
+                StreamChatInput(message="go", session_id="s-stats", origin="orchestrator"),
+                sub_agent_id=sub_agent_id,
+                user_id="u-1",
+            )
+            await drain_background_tasks()
+        finally:
+            set_turn_stats_hook(None)
+        return task, events
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_reports_tools_and_context(self, real_agent_config):
+        ok_start, ok_done = self._tool_actions("c1", "execute_sql")
+        bad_start, bad_done = self._tool_actions("c2", "execute_sql", ok=False)
+        node = self._fake_node([ok_start, ok_done, bad_start, bad_done])
+
+        task, events = await self._run(real_agent_config, node, stats_context={"trace_id": "tr-1"})
+
+        assert task.status == "completed"
+        assert len(events) == 1
+        event = events[0]
+        assert (event.status, event.agent_name, event.user_id, event.origin) == (
+            "completed",
+            "chat",
+            "u-1",
+            "orchestrator",
+        )
+        assert event.context == {"trace_id": "tr-1"}
+        assert event.subagents == []
+        (sql,) = event.tools
+        assert (sql.name, sql.caller, sql.calls, sql.success, sql.failed) == ("execute_sql", "main", 2, 1, 1)
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_still_reports_with_pending_call_interrupted(self, real_agent_config):
+        start, _ = self._tool_actions("c1", "write_file")
+        node = self._fake_node([start], raise_after=RuntimeError("model blew up"))
+
+        task, events = await self._run(real_agent_config, node)
+
+        assert task.status == "error"
+        (event,) = events
+        assert event.status == "error"
+        assert event.error == "model blew up"
+        (tool,) = event.tools
+        assert (tool.calls, tool.interrupted) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_still_reports(self, real_agent_config):
+        start, _ = self._tool_actions("c1", "execute_sql")
+        node = self._fake_node([start], raise_after=asyncio.CancelledError())
+
+        task, events = await self._run(real_agent_config, node)
+
+        assert task.status == "cancelled"
+        (event,) = events
+        assert event.status == "cancelled"
+        assert event.tools[0].interrupted == 1
+
+    @pytest.mark.asyncio
+    async def test_direct_subagent_turn_counts_as_one_direct_invocation(self, real_agent_config):
+        start, done = self._tool_actions("c1", "query_metrics")
+        node = self._fake_node([start, done])
+
+        _, events = await self._run(real_agent_config, node, sub_agent_id="gen_visual_report")
+
+        (event,) = events
+        assert event.agent_name == "gen_visual_report"
+        assert [(t.name, t.caller) for t in event.tools] == [("query_metrics", "subagent")]
+        (sub,) = event.subagents
+        assert (sub.name, sub.kind, sub.entry, sub.calls, sub.success, sub.tool_calls) == (
+            "gen_visual_report",
+            "builtin",
+            "direct",
+            1,
+            1,
+            1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_feedback_turn_is_not_a_direct_subagent_chat(self, real_agent_config):
+        start, done = self._tool_actions("c1", "write_file")
+
+        _, events = await self._run(real_agent_config, self._fake_node([start, done]), sub_agent_id="feedback")
+
+        (event,) = events
+        assert event.agent_name == "feedback"
+        assert event.subagents == []
+        assert event.tools[0].caller == "subagent"
+
+    @pytest.mark.asyncio
+    async def test_every_turn_gets_its_own_turn_id(self, real_agent_config):
+        ids = []
+        for _ in range(2):
+            _, events = await self._run(real_agent_config, self._fake_node([]), stats_context={"trace_id": "same"})
+            ids.append(events[0].turn_id)
+
+        assert all(ids) and ids[0] != ids[1]
+
+    @pytest.mark.asyncio
+    async def test_collector_failure_never_fails_the_turn(self, real_agent_config, monkeypatch):
+        from manager.api.services.turn_stats import TurnStatsCollector
+
+        def _boom(self, action):
+            raise RuntimeError("collector bug")
+
+        monkeypatch.setattr(TurnStatsCollector, "observe", _boom)
+        start, done = self._tool_actions("c1", "execute_sql")
+
+        task, events = await self._run(real_agent_config, self._fake_node([start, done]))
+
+        assert task.status == "completed"
+        assert any(e.event == "end" for e in task.events)
+        (event,) = events
+        assert event.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_no_hook_skips_observation(self, real_agent_config, monkeypatch):
+        from manager.api.models.cli_models import StreamChatInput
+        from manager.api.services.turn_stats import TurnStatsCollector
+
+        observed = []
+        monkeypatch.setattr(TurnStatsCollector, "observe", lambda self, action: observed.append(action))
+        start, done = self._tool_actions("c1", "execute_sql")
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: self._fake_node([start, done])  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-stats", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="go", session_id="s-stats"))
+
+        assert task.status == "completed"
+        assert observed == []
+
+    @pytest.mark.asyncio
+    async def test_no_hook_registered_is_a_noop(self, real_agent_config):
+        from manager.api.models.cli_models import StreamChatInput
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: self._fake_node([])  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-stats", asyncio_task=MagicMock())
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="go", session_id="s-stats"))
+
+        assert task.status == "completed"
+
+
+class TestRunLoopSettlesTurn:
+    """``_run_loop`` settles every turn with ``on_turn_end`` — the billing path."""
+
+    @staticmethod
+    def _node(raise_after=None, usage_total=120, extra_actions=()):
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+        from manager.schemas.token_usage import TokenUsage
+
+        class FakeNode:
+            session_id = "llm-sess"
+            running_turn_usage = None
+
+            def get_node_name(self):
+                return "chat"
+
+            async def execute_stream_with_interactions(self, action_history_manager):
+                # What TokenUsageHook does after an LLM call ...
+                self.running_turn_usage = TokenUsage(
+                    requests=2, input_tokens=100, output_tokens=20, total_tokens=usage_total
+                )
+                try:
+                    yield ActionHistory(
+                        action_id="a1",
+                        role=ActionRole.ASSISTANT,
+                        action_type="response",
+                        messages="",
+                        input={},
+                        output={},
+                        status=ActionStatus.PROCESSING,
+                    )
+                    for extra in extra_actions:
+                        yield extra
+                    if raise_after is not None:
+                        raise raise_after
+                finally:
+                    # ... and what the node does when its stream closes.
+                    self.running_turn_usage = None
+
+            async def get_last_turn_usage(self):
+                return None
+
+        return FakeNode()
+
+    async def _run(self, real_agent_config, node, *, on_turn_end=True):
+        from manager.api.models.cli_models import StreamChatInput
+
+        calls = []
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: node  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-bill", asyncio_task=MagicMock())
+        if on_turn_end:
+            task.on_turn_end = lambda usage, error, status, turn_id: calls.append((usage, error, status, turn_id))
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="go", session_id="s-bill"))
+        return task, calls
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_settles_with_end_event_usage(self, real_agent_config):
+        task, calls = await self._run(real_agent_config, self._node())
+
+        assert task.status == "completed"
+        ((usage, error, status, turn_id),) = calls
+        assert turn_id and turn_id == task.turn_id
+        assert (status, error) == ("completed", None)
+        # get_last_turn_usage() came back empty; the mid-turn snapshot fills in.
+        assert usage["total_tokens"] == 120
+        assert usage == task.end_usage
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_is_billed_what_it_consumed(self, real_agent_config):
+        task, calls = await self._run(real_agent_config, self._node(raise_after=asyncio.CancelledError()))
+
+        assert task.status == "cancelled"
+        ((usage, error, status, turn_id),) = calls
+        assert turn_id and turn_id == task.turn_id
+        assert (status, error) == ("cancelled", None)
+        assert (usage["session_id"], usage["llm_session_id"]) == ("s-bill", "llm-sess")
+        assert (usage["requests"], usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (
+            2,
+            100,
+            20,
+            120,
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_is_billed_what_it_consumed(self, real_agent_config):
+        task, calls = await self._run(real_agent_config, self._node(raise_after=RuntimeError("model blew up")))
+
+        assert task.status == "error"
+        ((usage, error, status, turn_id),) = calls
+        assert turn_id and turn_id == task.turn_id
+        assert (status, error) == ("error", "model blew up")
+        assert usage["total_tokens"] == 120
+
+    @staticmethod
+    def _error_action(depth=0, error="messages.1.content.0: Input tag 'output_text' found"):
+        from manager.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        return ActionHistory(
+            action_id=f"err-{depth}",
+            role=ActionRole.ASSISTANT,
+            action_type="error",
+            messages=f"chat interaction failed: {error}",
+            input={},
+            output={"success": False, "error": error, "error_code": None},
+            status=ActionStatus.FAILED,
+            depth=depth,
+        )
+
+    @pytest.mark.asyncio
+    async def test_turn_ending_in_a_node_error_action_settles_as_error(self, real_agent_config):
+        # The node catches the model failure and yields an ``error`` action
+        # instead of raising; the turn must not settle as completed.
+        node = self._node(extra_actions=(self._error_action(),))
+        task, calls = await self._run(real_agent_config, node)
+
+        assert task.status == "error"
+        assert task.error == "messages.1.content.0: Input tag 'output_text' found"
+        ((usage, error, status, _turn_id),) = calls
+        assert (status, error) == ("error", "messages.1.content.0: Input tag 'output_text' found")
+        # Still billed, and the stream still closed with its end event.
+        assert usage["total_tokens"] == 120
+        assert usage == task.end_usage
+        assert task.events[-1].event == "end"
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_error_action_does_not_fail_the_turn(self, real_agent_config):
+        node = self._node(extra_actions=(self._error_action(depth=1),))
+        task, calls = await self._run(real_agent_config, node)
+
+        assert task.status == "completed"
+        ((_usage, error, status, _turn_id),) = calls
+        assert (status, error) == ("completed", None)
+
+    @pytest.mark.asyncio
+    async def test_settlement_failure_never_fails_the_turn(self, real_agent_config):
+        from manager.api.models.cli_models import StreamChatInput
+
+        def _boom(*_args):
+            raise RuntimeError("host bug")
+
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: self._node()  # type: ignore[method-assign]
+        task = ChatTask(session_id="s-bill", asyncio_task=MagicMock())
+        task.on_turn_end = _boom
+
+        await manager._run_loop(task, real_agent_config, StreamChatInput(message="go", session_id="s-bill"))
+
+        assert task.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_no_callback_is_a_noop(self, real_agent_config):
+        task, calls = await self._run(real_agent_config, self._node(), on_turn_end=False)
+
+        assert task.status == "completed"
+        assert calls == []
+
+
+class TestStartChatSettlesExactlyOnce:
+    """``start_chat`` tasks settle once, even when cancelled before they ever run."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_before_first_step_still_settles_and_releases(self, real_agent_config):
+        from manager.api.models.cli_models import StreamChatInput
+
+        calls = []
+        manager = ChatTaskManager()
+        manager._create_node = MagicMock(side_effect=AssertionError("must not run"))  # type: ignore[method-assign]
+
+        task = await manager.start_chat(
+            real_agent_config,
+            StreamChatInput(message="go", session_id="s-early"),
+            on_turn_end=lambda *args: calls.append(args),
+        )
+        task.asyncio_task.cancel()  # before yielding to the loop: _run_loop never starts
+        with pytest.raises(asyncio.CancelledError):
+            await task.asyncio_task
+        await asyncio.sleep(0)  # let the done callback run
+
+        ((usage, error, status, turn_id),) = calls
+        assert (status, error) == ("cancelled", None)
+        assert usage == {"session_id": "s-early"}
+        assert turn_id == task.turn_id and turn_id
+        assert task.status == "cancelled"
+        assert "s-early" not in manager._tasks
+
+    @pytest.mark.asyncio
+    async def test_normal_turn_settles_exactly_once(self, real_agent_config):
+        from manager.api.models.cli_models import StreamChatInput
+
+        calls = []
+        manager = ChatTaskManager()
+        manager._create_node = lambda *args, **kwargs: TestRunLoopSettlesTurn._node()  # type: ignore[method-assign]
+
+        task = await manager.start_chat(
+            real_agent_config,
+            StreamChatInput(message="go", session_id="s-once"),
+            on_turn_end=lambda *args: calls.append(args),
+        )
+        await task.asyncio_task
+        await asyncio.sleep(0)
+
+        assert [c[2] for c in calls] == ["completed"]
+        assert calls[0][3] == task.turn_id
+
+
+class TestDirectSubagentDatasource:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("address", ["reca_agent", "custom-agent-id"])
+    @pytest.mark.parametrize("stale_target", ["request", "history", "default", "matching"])
+    async def test_saved_binding_controls_the_full_execution_target(
+        self, real_agent_config, monkeypatch, address, stale_target
+    ):
+        import copy
+        import json
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        original = real_agent_config.current_datasource
+        bound = copy.deepcopy(real_agent_config.current_db_config())
+        bound.type, bound.uri = "postgresql", ""
+        bound.database, bound.schema, bound.catalog = "bound_db", "bound_schema", ""
+        real_agent_config.services.datasources["reca"] = bound
+        real_agent_config.agentic_nodes["reca_agent"] = {
+            "id": "custom-agent-id",
+            "node_class": "gen_sql",
+            "scoped_context": {"datasource": "reca"},
+        }
+        sessions = MagicMock()
+        sessions.load_session_meta.return_value = (
+            json.dumps(
+                {
+                    "datasource": "reca" if stale_target == "matching" else original,
+                    "database": "selected_db" if stale_target == "matching" else "ik_db",
+                    "schema": "selected_schema" if stale_target == "matching" else "ik_schema",
+                }
+            )
+            if stale_target in {"history", "matching"}
+            else None
+        )
+        manager = ChatTaskManager()
+        monkeypatch.setattr(manager, "_session_manager", lambda *args: sessions)
+        observed = {}
+
+        async def run(task, config, request, **kwargs):
+            observed.update(config.runtime_db_context())
+            observed["request_datasource"] = request.datasource
+
+        monkeypatch.setattr(manager, "_run_loop", run)
+        selection = {"datasource": original, "catalog": "ik_cat", "database": "ik_db", "db_schema": "ik_schema"}
+        request = StreamChatInput(
+            message="query", session_id="direct", **(selection if stale_target == "request" else {})
+        )
+        task = await manager.start_chat(real_agent_config, request, sub_agent_id=address)
+        await task.asyncio_task
+
+        assert observed["datasource"] == "reca"
+        assert observed["request_datasource"] == "reca"
+        assert observed["database"] == ("selected_db" if stale_target == "matching" else "bound_db")
+        assert observed["schema"] == ("selected_schema" if stale_target == "matching" else "bound_schema")
+        assert observed["catalog"] == ""
+        assert real_agent_config.current_datasource == original
+
+    @pytest.mark.asyncio
+    async def test_missing_bound_datasource_does_not_fall_back(self, real_agent_config, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from manager.api.models.cli_models import StreamChatInput
+
+        real_agent_config.agentic_nodes["custom"] = {"scoped_context": {"datasource": "removed"}}
+        manager = ChatTaskManager()
+        run = AsyncMock()
+        monkeypatch.setattr(manager, "_run_loop", run)
+        with pytest.raises(ValueError, match="not bound"):
+            await manager.start_chat(real_agent_config, StreamChatInput(message="query"), sub_agent_id="custom")
+        run.assert_not_awaited()
+
+
+@pytest.mark.parametrize("session_id", [None, "explicit-session", ""])
+def test_host_node_factory_delegates_or_fails_closed(real_agent_config, monkeypatch, session_id):
+    """Host dispatch and fallback share the effective session and fail closed."""
+    from unittest.mock import Mock
+
+    from manager.agent.node import node_factory
+
+    builtin, hosted = object(), object()
+    fallback = Mock(return_value=builtin)
+    extension = Mock(return_value=hosted)
+    monkeypatch.setattr(node_factory, "create_interactive_node", fallback)
+    manager = ChatTaskManager(node_factory=extension)
+    assert manager._create_node(real_agent_config, "ask_metrics", "session", "owner", False, session_id) is hosted
+    extension.assert_called_once_with(
+        agent_config=real_agent_config,
+        subagent_id="ask_metrics",
+        node_id="session",
+        user_id="owner",
+        interactive=False,
+        session_id="session" if session_id is None else session_id,
+    )
+    fallback.assert_not_called()
+    extension.return_value = None
+    assert manager._create_node(real_agent_config, "chat", "normal", "owner", session_id=session_id) is builtin
+    fallback.assert_called_once()
+    assert fallback.call_args.kwargs["session_id"] == ("normal" if session_id is None else session_id)
+    extension.side_effect = ValueError("Host authorization denied")
+    with pytest.raises(ValueError, match="authorization"):
+        manager._create_node(real_agent_config, "chat", "denied", "owner")
+    assert fallback.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_user_events_and_residual_inserts_reach_client():
+    """Accepted history must not hide streamed user messages or queued inserts."""
+    from manager.api.models.cli_models import IMessageContent, SSEMessageData, SSEMessagePayload
+    from manager.api.services.chat_task_manager import ChatTask
+
+    manager = ChatTaskManager()
+    task = ChatTask("accepted", None)
+
+    def event(role):
+        """Build a rendered message for either conversation role."""
+        return SSEEvent(
+            id=1,
+            event="message",
+            timestamp="2026-11-05T00:00:00Z",
+            data=SSEMessageData(
+                type="createMessage",
+                payload=SSEMessagePayload(
+                    message_id="1", role=role, content=[IMessageContent(type="markdown", payload={"content": "hello"})]
+                ),
+            ),
+        )
+
+    opening, reply = event("user"), event("assistant")
+    await manager._push_event(task, opening)
+    assert task.events == [opening]
+    await manager._push_event(task, reply)
+    await manager._push_event(task, opening)
+    assert task.events == [opening, reply, opening]
+
+    residual = ChatTask("accepted-residual", None)
+    next_id = await manager._emit_user_insert_sse(residual, "follow up", 2)
+    assert next_id == 3
+    assert len(residual.events) == 1
+    assert residual.events[0].data.payload.role == "user"
+    assert residual.events[0].data.payload.content[0].payload["content"] == "follow up"

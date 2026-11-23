@@ -1,0 +1,650 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+import asyncio
+import hashlib
+import json
+import os
+import threading
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from typing import Any, AsyncGenerator, Callable, ClassVar, Dict, List, Optional, Tuple, Union
+
+from agents import SQLiteSession, Tool
+from agents.mcp import MCPServerStdio
+from agents.run import CallModelData, ModelInputData, RunConfig
+from agents.run_config import ToolErrorFormatterArgs
+
+from manager.configuration.agent_config import AgentConfig, ModelConfig
+from manager.observability.model_call import observe_model_phase
+from manager.schemas.action_history import ActionHistory, ActionHistoryManager
+from manager.utils.constants import LLMProvider
+from manager.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _format_sdk_tool_error(args: ToolErrorFormatterArgs) -> Optional[str]:
+    """Use the shared FuncToolResult failure contract for unknown tools."""
+    if args.kind != "tool_not_found":
+        return None
+    return json.dumps({"success": 0, "error": args.default_message, "result": None})
+
+
+class LLMBaseModel(ABC):  # Changed from BaseModel to LLMBaseModel
+    """
+    Abstract base class for all language model implementations.
+    Provides a common interface for different LLM providers.
+    """
+
+    MODEL_TYPE_MAP: ClassVar[Dict[str, str]] = {
+        LLMProvider.DEEPSEEK: "DeepSeekModel",
+        LLMProvider.QWEN: "QwenModel",
+        LLMProvider.OPENAI: "OpenAIModel",
+        LLMProvider.CLAUDE: "ClaudeModel",
+        LLMProvider.GEMINI: "GeminiModel",
+        LLMProvider.KIMI: "KimiModel",
+        LLMProvider.CODEX: "CodexModel",
+        LLMProvider.OPENROUTER: "OpenRouterModel",
+        LLMProvider.MINIMAX: "MiniMaxModel",
+        LLMProvider.GLM: "GLMModel",
+    }
+
+    # Module-level LRU cache for instantiated models. Keyed on the
+    # configuration fingerprint so ``/model`` can flip ``active_model()``
+    # between ``(openai, gpt-4.1)`` and ``(kimi, kimi-k2.6)`` without
+    # repeatedly paying the client-construction cost (LiteLLM + tokenizer
+    # download). Size is intentionally tiny — users seldom juggle more
+    # than a handful of models — so stale entries are evicted quickly.
+    _MODEL_CACHE_MAXSIZE: ClassVar[int] = 4
+    _MODEL_CACHE: ClassVar["OrderedDict[Tuple, LLMBaseModel]"] = OrderedDict()
+    _MODEL_CACHE_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    def __init__(self, model_config: ModelConfig, **kwargs):
+        """Initialize model with configuration and parameters"""
+        self.model_config = model_config  # Model configuration
+        # Session storage location passed through to AgenticNode-owned SessionManager.
+        # The model itself no longer owns session state — these attributes remain
+        # only because LLMBaseModel.create_model still forwards them on construction.
+        self.session_dir = kwargs.get("session_dir")
+        self.session_scope = kwargs.get("session_scope")
+
+    @classmethod
+    def create_model(cls, agent_config: AgentConfig, model_name: str = None, **kwargs) -> "LLMBaseModel":
+        """Resolve the active LLM and return an instance (cached per config).
+
+        Caching is keyed on the fingerprint of the resolved
+        :class:`ModelConfig` (type, model, base_url, api_key digest,
+        auth_type, session scope). That way a ``/model`` switch produces
+        a different key and a fresh instance; subsequent calls under the
+        same selection reuse the cached client. The cache is process-wide
+        and bounded to ``_MODEL_CACHE_MAXSIZE`` entries so it is safe to
+        hold across long-running sessions.
+        """
+        try:
+            target_config = agent_config.resolve_model_ref(model_name)
+        except (ValueError, KeyError) as exc:
+            raise KeyError(f"Model {model_name} not found in agent_config") from exc
+
+        model_type = target_config.type
+
+        if model_type not in cls.MODEL_TYPE_MAP:
+            raise KeyError(f"Unsupported model type: {model_type}")
+
+        scope = kwargs.get("scope")
+        api_key_digest = (
+            hashlib.sha1((target_config.api_key or "").encode("utf-8")).hexdigest()[:12]
+            if target_config.api_key
+            else ""
+        )
+        cache_key: Tuple = (
+            model_type,
+            target_config.model,
+            target_config.base_url or "",
+            api_key_digest,
+            target_config.auth_type,
+            scope or "",
+            # Include reasoning-related fields so ``/effort`` and a toggled
+            # ``enable_thinking`` produce a fresh adapter instead of reusing
+            # one bound to the previous effort level.
+            bool(target_config.enable_thinking),
+            target_config.reasoning_effort or "",
+            target_config.context_length,
+            target_config.max_tokens,
+            target_config.tokenizer_ref,
+        )
+
+        with cls._MODEL_CACHE_LOCK:
+            cached = cls._MODEL_CACHE.get(cache_key)
+            if cached is not None:
+                cls._MODEL_CACHE.move_to_end(cache_key)
+                return cached
+
+        instance = cls.from_config(
+            target_config,
+            session_dir=agent_config.session_dir,
+            session_scope=scope,
+        )
+
+        with cls._MODEL_CACHE_LOCK:
+            cls._MODEL_CACHE[cache_key] = instance
+            cls._MODEL_CACHE.move_to_end(cache_key)
+            while len(cls._MODEL_CACHE) > cls._MODEL_CACHE_MAXSIZE:
+                cls._MODEL_CACHE.popitem(last=False)
+        return instance
+
+    @classmethod
+    def from_config(cls, model_config: ModelConfig, **kwargs) -> "LLMBaseModel":
+        """Use the chat provider registry without requiring tools or project services."""
+        model_type = model_config.type
+        model_class_name = cls.MODEL_TYPE_MAP.get(model_type)
+        if model_class_name is None:
+            raise KeyError(f"Unsupported model type: {model_type}")
+        module = __import__(f"manager.models.{model_type}_model", fromlist=[model_class_name])
+        return getattr(module, model_class_name)(model_config=model_config, **kwargs)
+
+    def request_capacity(self):
+        """Resolve immutable capacity metadata without changing a cached model."""
+        from manager.models.request_capacity import DEFAULT_CONTEXT_LENGTH, DEFAULT_MAX_TOKENS, RequestCapacity
+
+        config = self.model_config
+        adapter = getattr(self, "litellm_adapter", None)
+        custom_endpoint = getattr(adapter, "is_custom_endpoint", False) is True
+        name = getattr(adapter, "litellm_model_name", None) or config.model
+        import litellm
+
+        def optional_limit(field: str, resolve: Callable[[], Any]) -> Optional[int]:
+            try:
+                value = resolve()
+                return value if type(value) is int and value > 0 else None
+            except Exception as exc:
+                logger.warning(
+                    "Model metadata unavailable: model=%s field=%s error=%s", name, field, type(exc).__name__
+                )
+                return None
+
+        try:
+            info = litellm.model_cost.get(name, litellm.model_cost.get(config.model, {}))
+        except Exception:
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        info_context = optional_limit("max_input_tokens", lambda: info.get("max_input_tokens"))
+        info_output = optional_limit("max_output_tokens", lambda: info.get("max_output_tokens"))
+        supports_limit = getattr(self, "supports_output_limit", True)
+        lookup_spec = getattr(self, "_lookup_spec", None)
+        spec_output = optional_limit("max_tokens", lambda: lookup_spec("max_tokens")) if callable(lookup_spec) else None
+        spec_context = (
+            optional_limit("context_length", lambda: lookup_spec("context_length")) if callable(lookup_spec) else None
+        )
+        output_ceiling = spec_output or info_output
+        if not supports_limit:
+            output_ceiling = max(output_ceiling or 0, info_output or 0) or None
+        context_length = (
+            config.context_length
+            or spec_context
+            or info_context
+            or optional_limit("context_length", self.context_length)
+            or DEFAULT_CONTEXT_LENGTH
+        )
+        catalog_context = spec_context or info_context or context_length != DEFAULT_CONTEXT_LENGTH
+        catalog_output = spec_output or info_output
+        default_output = config.max_tokens
+        if not default_output:
+            model_default = (
+                optional_limit("max_tokens", self.max_tokens) or spec_output or info_output or DEFAULT_MAX_TOKENS
+            )
+            if not custom_endpoint and supports_limit and output_ceiling:
+                model_default = min(model_default, output_ceiling)
+            default_output = self._default_output_limit(model_default, context_length)
+        return RequestCapacity(
+            model=name,
+            context_length=context_length,
+            default_output=default_output,
+            tokenizer_ref=config.tokenizer_ref,
+            supports_output_limit=supports_limit,
+            output_ceiling=output_ceiling,
+            context_source="config" if config.context_length else "catalog" if catalog_context else "default",
+            output_source="config" if config.max_tokens else "catalog" if catalog_output else "default",
+            enforce_catalog_limits=not custom_endpoint,
+            allow_estimated_overflow=custom_endpoint
+            or not bool(spec_context or info_context or spec_output or info_output),
+            send_default_output=not (
+                custom_endpoint and name.startswith("openai/") and not config.max_tokens and not catalog_output
+            ),
+        )
+
+    def _default_output_limit(self, model_limit: Optional[int], context_length: Optional[int] = None) -> Optional[int]:
+        """Leave input headroom when a model's output ceiling fills its window.
+
+        Explicit configuration/request limits are validated unchanged. A model
+        ceiling is only a default, so reserve at most half the usable context
+        after the safety margin for output, leaving the other half for input.
+        Providers that cannot enforce an output cap must reserve their full limit.
+        """
+        context = context_length or self.model_config.context_length or self.context_length()
+        if model_limit and context and getattr(self, "supports_output_limit", True):
+            from manager.models.request_capacity import RequestCapacity
+
+            usable = context - RequestCapacity.margin_for(context)
+            return min(model_limit, max(1, usable // 2))
+        return model_limit
+
+    def check_request(self, payload: dict, output_parameter: str = "max_tokens") -> dict:
+        """Normalize output parameters and check the effective wire request."""
+        from manager.models.request_capacity import guard_request
+
+        request = dict(payload)
+        capacity = self.request_capacity()
+        if capacity.supports_output_limit:
+            output = capacity.request_output_limit(request.get(output_parameter))
+            if output is None:
+                request.pop(output_parameter, None)
+            else:
+                request[output_parameter] = output
+        guard_request(capacity, request)
+        return request
+
+    @abstractmethod
+    def generate(self, prompt: Any, enable_thinking: bool = False, **kwargs) -> str:
+        """
+        Generate a response from the language model.
+
+        Args:
+            prompt: The input prompt to send to the model
+            enable_thinking: Enable thinking mode for hybrid models (default: False)
+            **kwargs: Additional generation parameters
+
+        Returns:
+            The generated text response
+        """
+
+    @abstractmethod
+    def generate_with_json_output(self, prompt: Any, **kwargs) -> Dict:
+        """
+        Generate a response and ensure it conforms to the provided JSON schema.
+
+        Args:
+            prompt: The input prompt to send to the model
+            **kwargs: Additional generation parameters
+
+        Returns:
+            A dictionary representing the JSON response
+        """
+
+    @abstractmethod
+    async def generate_with_tools(
+        self,
+        prompt: Union[str, List[Dict[str, str]]],
+        tools: Optional[List[Tool]] = None,
+        mcp_servers: Optional[Dict[str, MCPServerStdio]] = None,
+        instruction: str = "",
+        output_type: type = str,
+        max_turns: int = 10,
+        session: Optional[SQLiteSession] = None,
+        **kwargs,
+    ) -> Dict:
+        """Generate response with unified tool support.
+
+        Args:
+            prompt: Input prompt(user prompt)
+            tools: Optional regular tools to use
+            mcp_servers: Optional MCP servers to use
+            instruction: System instruction(system prompt)
+            output_type: Expected output type
+            max_turns: Maximum conversation turns
+            session: Optional session for multi-turn context
+            **kwargs: Additional parameters
+
+        Returns:
+            Result with content and sql_contexts
+        """
+
+    @abstractmethod
+    async def generate_with_tools_stream(
+        self,
+        prompt: Union[str, List[Dict[str, str]]],
+        tools: Optional[List[Tool]] = None,
+        mcp_servers: Optional[Dict[str, MCPServerStdio]] = None,
+        instruction: str = "",
+        output_type: type = str,
+        max_turns: int = 10,
+        session: Optional[SQLiteSession] = None,
+        action_history_manager: Optional[ActionHistoryManager] = None,
+        hooks=None,
+        interrupt_controller=None,
+        **kwargs,
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Generate response with streaming and tool support.
+
+        This replaces generate_with_mcp_stream and supports both MCP servers and regular tools.
+
+        Args:
+            prompt: Input prompt
+            mcp_servers: Optional MCP servers
+            tools: Optional regular tools
+            instruction: System instruction
+            output_type: Expected output type
+            max_turns: Maximum turns
+            session: Optional session for multi-turn context
+            action_history_manager: Action history manager for streaming
+            hooks: Optional hooks for tool interception
+            **kwargs: Additional parameters
+
+        Yields:
+            ActionHistory objects for streaming updates
+        """
+
+    def set_context(self, workflow=None, current_node=None):
+        """
+        Set workflow and node context for potential trace saving.
+        """
+        self.workflow = workflow
+        self.current_node = current_node
+
+    @staticmethod
+    def drain_pending_user_inserts(
+        pending_input_queue,
+        interrupt_controller=None,
+        interaction_broker=None,
+    ) -> List[str]:
+        """Drain mid-run user messages staged during the current agent run.
+
+        Shared by every model path that supports mid-run insertion so the
+        "when is a staged message flushed" contract has exactly one definition:
+        at a turn boundary, all-or-nothing, and never while an interrupt is in
+        flight (an aborting run must not swallow text the user will re-send).
+
+        Each drained message is emitted as a USER ``ActionHistory`` through the
+        broker so the CLI transcript and the API SSE stream show the injection
+        at the moment the model actually receives it. Callers own the
+        provider-specific step of appending the text to the model input.
+
+        Returns the drained messages in FIFO order, empty when there is
+        nothing to flush.
+        """
+        if pending_input_queue is None:
+            return []
+        if interrupt_controller is not None and getattr(interrupt_controller, "is_interrupted", False):
+            return []
+        try:
+            pending = pending_input_queue.drain()
+        except Exception:  # noqa: BLE001 — a queue hiccup must never abort the run
+            logger.exception("Failed to drain pending user inserts; continuing without them.")
+            return []
+        if not pending:
+            return []
+
+        if interaction_broker is not None:
+            for text in pending:
+                try:
+                    interaction_broker.emit_user_insert(text)
+                except Exception:  # noqa: BLE001 — emission is best-effort
+                    logger.exception("Failed to emit user_insert ActionHistory; model still sees the text.")
+        return pending
+
+    @observe_model_phase("compact_summary")
+    async def summarize_items(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        instruction: str,
+        prompt: str,
+        item_format: str = "responses",
+        max_tokens: int = 4000,
+        temperature: float = 0.3,
+        agent_name: str = "",
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Single-shot, tool-less, session-less completion over an explicit transcript.
+
+        Used by context compaction to summarize the conversation the model is
+        *currently* being sent — an in-memory item list that may differ from
+        the persisted session mid-run. ``session=None`` guarantees the live
+        session is never written by the summary call, and no hooks are wired so
+        the summary's own (large) input never pollutes the node's running usage
+        snapshot.
+
+        The default implementation speaks Responses-API items and appends the
+        summarization ``prompt`` as a trailing user message. Providers whose
+        transcripts use another wire format (Claude native) override this.
+
+        Returns the same ``{"content", "usage", "model", ...}`` dict as
+        :meth:`generate_with_tools`.
+        """
+        if item_format != "responses":
+            from manager.utils.exceptions import ManagerException, ErrorCode
+
+            raise ManagerException(
+                ErrorCode.COMMON_UNSUPPORTED,
+                message_args={"field_name": "item_format", "your_value": item_format},
+            )
+        from manager.models.summary_chunks import summary_input
+
+        return await self.generate_with_tools(
+            prompt=summary_input(items, prompt),
+            tools=None,
+            mcp_servers=None,
+            instruction=instruction,
+            session=None,
+            max_turns=1,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            agent_name=agent_name,
+            **kwargs,
+        )
+
+    def summary_capacity_checker(
+        self, instruction: str, prompt: str, item_format: str, output_tokens: int
+    ) -> Callable[[List[Any]], int]:
+        """Build a local capacity check for a single tool-less summary call."""
+        from manager.models.summary_chunks import summary_payload
+
+        capacity = self.request_capacity()
+        return lambda items: capacity.check(summary_payload(items, instruction, prompt), output_tokens)
+
+    def _build_run_config(
+        self,
+        pending_input_queue=None,
+        session: Optional[SQLiteSession] = None,
+        interrupt_controller=None,
+        interaction_broker=None,
+        agent_name: Optional[str] = None,
+        context_rewriter=None,
+    ) -> RunConfig:
+        """Build a :class:`RunConfig` with tool feedback and an optional input filter.
+
+        Lives on the base class because every agents-SDK-driven provider needs
+        the same filter: ``OpenAICompatibleModel`` and ``CodexModel`` build
+        their own ``Runner.run_streamed`` calls, and a provider that quietly
+        omits the filter silently loses mid-run insertion and mid-turn
+        compaction.
+
+        Unknown function tools produce a tool result for the model to correct
+        within the current run. Raising would restart the entire request with
+        the same stale history and persist the user's input again. Recovery
+        still counts toward the caller's ``max_turns`` limit.
+
+        The filter is invoked by the SDK before every LLM turn within a
+        ``Runner.run_streamed`` invocation (``agents/run.py`` ~1483). In order:
+
+        1. Anchor the original request, drain queued user inserts, and include
+           them in the view that will be checked.
+        2. Check capacity on every request (including the first), install any
+           rewritten view, and return its current system instructions.
+        3. Acknowledge original SDK input already persisted by a first-request
+           rewrite so the SDK's subsequent input append cannot duplicate it.
+
+        All exceptions in the filter body are swallowed: the SDK re-raises
+        uncaught filter errors and aborts the entire run, which we must never
+        let a queue or sqlite hiccup do.
+        """
+        from manager.utils.trace_context import build_agents_run_config_kwargs
+
+        trace_kwargs = build_agents_run_config_kwargs(agent_name=agent_name)
+        if pending_input_queue is None and context_rewriter is None:
+            return RunConfig(
+                tool_not_found_behavior="return_error_to_model",
+                tool_error_formatter=_format_sdk_tool_error,
+                **trace_kwargs,
+            )
+
+        pending_original_input: List[Any] = []
+
+        def merge_session_input(history, new_input):
+            nonlocal pending_original_input
+            pending_original_input = list(new_input)
+            from manager.models.sqlite_session import ManagerSQLiteSession
+
+            if isinstance(session, ManagerSQLiteSession):
+                session.skip_persisted_input_once([])
+            return history + new_input
+
+        async def _filter(data: CallModelData) -> ModelInputData:
+            nonlocal pending_original_input
+            raw = list(data.model_data.input)
+            view = list(raw)
+            try:
+                if context_rewriter is not None:
+                    context_rewriter.anchor_turn(raw)
+                pending = LLMBaseModel.drain_pending_user_inserts(
+                    pending_input_queue,
+                    interrupt_controller=interrupt_controller,
+                    interaction_broker=interaction_broker,
+                )
+                if context_rewriter is None and not pending:
+                    return data.model_data
+                for text in pending:
+                    user_item = {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    }
+                    view.append(user_item)
+                    if context_rewriter is not None:
+                        try:
+                            context_rewriter.pin_insert(len(raw), user_item)
+                        except Exception:  # noqa: BLE001 — pinning is best-effort
+                            logger.exception("Failed to pin injected user item on the context rewriter.")
+                    if session is not None:
+                        try:
+                            await session.add_items([user_item])
+                        except Exception:  # noqa: BLE001 — never abort the run on a session write
+                            logger.exception("Failed to persist injected user item; in-memory only.")
+                instructions = data.model_data.instructions
+                if context_rewriter is not None:
+                    from agents import RunContextWrapper
+
+                    tool_schemas = None
+                    try:
+                        all_tools = await data.agent.get_all_tools(RunContextWrapper(context=data.context))
+                        tool_schemas = [
+                            {
+                                "name": getattr(tool, "name", ""),
+                                "description": getattr(tool, "description", ""),
+                                "parameters": getattr(tool, "params_json_schema", {}),
+                            }
+                            for tool in all_tools
+                        ]
+                    except Exception:
+                        # Discovery is only needed for the capacity estimate.
+                        # Keep the last schemas and still replay the compacted view.
+                        logger.warning(
+                            "Cannot refresh compaction tool schemas; retaining previous schemas", exc_info=True
+                        )
+                    context_rewriter.set_request_context(
+                        instructions, tool_schemas, data.agent.model_settings.max_tokens
+                    )
+                    # Inserts are already pinned. Pass the original SDK list so
+                    # the overlay remains aligned across subsequent calls.
+                    from manager.agent.node.context_rewriter import extract_user_text
+                    from manager.models.sqlite_session import ManagerSQLiteSession
+
+                    context_rewriter.pending_user_turns = sum(
+                        extract_user_text(item) is not None for item in pending_original_input
+                    )
+                    before = context_rewriter.compactions
+                    view = await context_rewriter.rewrite_sdk_input(list(data.model_data.input))
+                    if context_rewriter.compactions > before and isinstance(session, ManagerSQLiteSession):
+                        session.skip_persisted_input_once(pending_original_input)
+                    pending_original_input = []
+                    instructions = context_rewriter.system_instruction
+                return ModelInputData(input=view, instructions=instructions)
+            except Exception as exc:  # noqa: BLE001 — optional queue handling remains best effort
+                from manager.models.request_capacity import ContextCapacityError
+
+                if isinstance(exc, ContextCapacityError):
+                    raise
+                logger.exception("call_model_input_filter raised; returning the current input view.")
+                return ModelInputData(input=view, instructions=data.model_data.instructions)
+
+        return RunConfig(
+            tool_not_found_behavior="return_error_to_model",
+            tool_error_formatter=_format_sdk_tool_error,
+            call_model_input_filter=_filter,
+            session_input_callback=merge_session_input if context_rewriter is not None else None,
+            **trace_kwargs,
+        )
+
+    def supports_builtin_web_search(self) -> bool:
+        """Whether this provider serves web search through a vendor-native tool.
+
+        When True, the node suppresses the local ``web_tool.web_search`` function
+        tool and the model layer injects the hosted/server-side web search tool
+        instead. Defaults to False — most providers rely on the local backend.
+        """
+        return False
+
+    def supports_builtin_web_fetch(self) -> bool:
+        """Whether this provider serves web fetch through a vendor-native tool.
+
+        When True, the node suppresses the local ``web_tool.web_fetch`` function
+        tool and the model layer injects the hosted/server-side fetch tool.
+        Defaults to False — the local httpx backend is used.
+        """
+        return False
+
+    @abstractmethod
+    def token_count(self, prompt: str) -> int:
+        pass
+
+    def max_tokens(self) -> Optional[int]:
+        """Return the configured output limit when a model has no spec lookup."""
+        return self.model_config.max_tokens
+
+    @abstractmethod
+    def context_length(self) -> Optional[int]:
+        """
+        Get the context length for the model.
+
+        Returns:
+            Context length, or None if unavailable
+        """
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"model_name": self.model_config.model}
+
+    async def test_connection(self, timeout: float = 10.0) -> Tuple[bool, str]:
+        """Probe the model with a 1-token request; return (ok, error_message).
+
+        Used by ``/model`` to verify provider
+        credentials before persisting them. The default implementation runs
+        the synchronous :meth:`generate` inside a worker thread wrapped in
+        ``asyncio.wait_for`` so both blocking HTTP clients and genuinely
+        async providers converge on the same coroutine signature. Subclasses
+        (e.g. Claude subscription) override when their endpoint rejects
+        ``max_tokens=1``.
+        """
+        try:
+            probe = asyncio.to_thread(self.generate, "hi", max_tokens=1)
+            response = await asyncio.wait_for(probe, timeout=timeout)
+            if response is None or not str(response).strip():
+                return False, "Empty response from model"
+            return True, ""
+        except asyncio.TimeoutError:
+            return False, f"Timed out after {timeout}s"
+        except Exception as e:
+            return False, str(e)
