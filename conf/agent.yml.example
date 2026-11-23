@@ -1,0 +1,26 @@
+# Manager Agent 配置模板
+# 首次执行 ./start.sh 时会被复制为 conf/agent.yml，
+# 并把 __ROOT__ 换成仓库绝对路径、__API_KEY__ 换成环境变量 DEEPSEEK_API_KEY。
+agent:
+  home: __ROOT__/manager-home
+  language: zh
+
+  # --- LLM provider ---
+  providers:
+    deepseek:
+      api_key: __API_KEY__
+
+  # --- 当前使用的模型（provider 级选择）---
+  target_provider: deepseek
+  target_model: deepseek-v4-pro
+
+  # --- 数据源 ---
+  services:
+    datasources:
+      duckdb_demo:
+        type: duckdb
+        uri: __ROOT__/manager-home/sample/duckdb-demo.duckdb
+        default: true
+      california_schools:
+        type: sqlite
+        uri: __ROOT__/manager-home/benchmark/california_schools/california_schools.sqlite

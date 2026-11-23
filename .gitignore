@@ -1,0 +1,13 @@
+# 运行时产物（不进版本库）
+.venv/
+manager-home/
+runtime-home/
+logs/
+run/
+subject/
+.pipcache/
+__pycache__/
+*.pyc
+
+# 含 API Key 的实际配置
+conf/agent.yml

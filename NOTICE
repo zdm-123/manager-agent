@@ -1,0 +1,23 @@
+Manager Agent — deployment scaffold
+Copyright 2026 zdm-123
+
+This product bundles / depends on the following third-party software:
+
+1. Datus-agent 0.4.5
+   Copyright DatusAI, Inc.
+   Licensed under the Apache License, Version 2.0
+   https://github.com/Datus-ai/Datus-agent
+
+2. @datus/web-chatbot 2.0.0 (web-assets/datus-chatbot.*)
+   Build artifact of the Datus project's web chatbot frontend.
+   Copyright DatusAI, Inc.
+   Licensed under the Apache License, Version 2.0
+   https://github.com/Datus-ai/Datus-agent
+
+3. React 18.3.1 (web-assets/react.production.min.js)
+   Copyright Meta Platforms, Inc. and affiliates.
+   Licensed under the MIT License
+   https://github.com/facebook/react
+
+The scripts and documentation authored in this repository are licensed
+under the Apache License, Version 2.0.
