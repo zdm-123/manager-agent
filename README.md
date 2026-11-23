@@ -5,6 +5,52 @@
 打开浏览器即可用自然语言提问，Agent 会自己查元数据、写 SQL、执行并给出结论；
 每一次追问与纠错都会沉淀为上下文，让后续回答越来越准。
 
+## 架构
+
+```mermaid
+flowchart TB
+    subgraph U["使用者"]
+        B["浏览器 · React 对话界面"]
+        C["REST / CLI / MCP 客户端"]
+    end
+
+    subgraph S["接入层"]
+        W["Web 服务 · FastAPI :8501"]
+        A["REST API · :8000"]
+        M["MCP Server"]
+    end
+
+    subgraph G["Agent 核心"]
+        O["对话编排"]
+        SA["子 Agent<br/>SQL 生成 · 语义建模 · 报表 · 看板 · ETL"]
+        T["工具集<br/>查询执行 · 元数据 · 文件 · 脚本"]
+        CTX["上下文引擎<br/>元数据 · 指标 · 参考 SQL · 知识库"]
+    end
+
+    subgraph D["数据与存储"]
+        DS["数据源<br/>DuckDB · SQLite · MySQL · PostgreSQL<br/>Snowflake · BigQuery · ClickHouse 等"]
+        ST["本地存储<br/>LanceDB 向量库 · SQLite 会话与元数据"]
+    end
+
+    LLM["大模型<br/>DeepSeek / OpenAI / Claude / 本地模型"]
+
+    B --> W
+    C --> A
+    C --> M
+    W --> O
+    A --> O
+    M --> O
+    O --> SA
+    O --> T
+    SA --> T
+    O --> CTX
+    CTX --> O
+    CTX --> ST
+    T --> DS
+    O --> LLM
+    SA --> LLM
+```
+
 ## 功能特性
 
 **对话式分析**
